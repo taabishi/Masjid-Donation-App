@@ -1,57 +1,73 @@
-# Deploying a demo you can open from anywhere
+# Deploying a demo you can open from anywhere (all on Vercel)
 
 Three pieces, set up in this order:
 
 | Piece | Host | What it does |
 |---|---|---|
 | Database | Supabase | Stores everything |
-| API (`apps/api`) | Render | Needs a server that stays running (background jobs) |
-| Web app (`apps/app`) | Vercel | The site people open |
+| API (`apps/api`) | Vercel project #1 | Runs as Vercel functions |
+| Web app (`apps/app`) | Vercel project #2 | The site people open |
+
+Both Vercel projects come from this same GitHub repo, with different **Root Directory** settings.
 
 This guide deploys the **demo**: fake payments, nothing real moves, demo mosques included. For real money, finish the Stripe setup in the README first. Don't share a demo link publicly: anyone who has it can create accounts.
 
 ## 1. Supabase (database)
 
 1. Create a project at supabase.com. Save the database password.
-2. Click **Connect** at the top of the project. Choose the **Session pooler** connection string (it works over IPv4, which Render needs; the "direct connection" is IPv6-only on the free plan). It looks like `postgres://postgres.<ref>:<PASSWORD>@aws-0-<region>.pooler.supabase.com:5432/postgres`. Put your real password in; if it has special characters, URL-encode them.
-3. **Project Settings > Database > SSL Configuration**: download the CA certificate. Open it in a text editor; you'll paste the whole text (including the BEGIN/END lines) into Render.
+2. Click **Connect** at the top of the project and copy the **Transaction pooler** connection string (port 6543). Vercel runs many short-lived function instances, and the transaction pooler is made for that. Replace `[YOUR-PASSWORD]` with your password (URL-encode special characters).
+3. **Project Settings > Database > SSL Configuration**: download the CA certificate and open it in a text editor. You'll paste the whole text, including the BEGIN/END lines.
 
-## 2. Render (API)
-
-1. Push this repo to GitHub (already done) and sign up at render.com with GitHub.
-2. **New > Blueprint**, pick this repository. Render reads `render.yaml`.
-3. Fill in the values it asks for:
-   - `DATABASE_URL`: the session pooler string from step 1.
-   - `DATABASE_CA_CERT`: the certificate text.
-   - `OPERATOR_EMAILS`: your email, e.g. `you@example.com`.
-   - `API_PUBLIC_URL`, `CORS_ORIGINS`, `APP_RETURN_PREFIXES`: type `https://placeholder.example` for now. You'll fix them in step 4. (The API will start but the web app can't call it until you do.)
-4. Deploy. When it's live, note its address, e.g. `https://masjid-donation-api.onrender.com`. Opening `<address>/health` should show `{"ok":true}`. The first start creates the database tables automatically.
-
-## 3. Vercel (web app)
+## 2. Vercel project #1: the API
 
 1. **Add New > Project**, import this repository.
-2. Set **Root Directory** to `apps/app`. Leave the framework as "Other"; `apps/app/vercel.json` sets the build command and output folder.
-3. Under **Environment Variables** add `EXPO_PUBLIC_API_URL` = your Render address (no trailing slash). This is baked in at build time, so changing it later means redeploying.
+2. Set **Root Directory** to `apps/api`. Leave the framework as "Other". `apps/api/vercel.json` sets the build, the function, and a daily scheduled job.
+3. Add **Environment Variables** (all environments):
+
+| Name | Value |
+|---|---|
+| `NODE_ENV` | `production` |
+| `DATABASE_URL` | the transaction pooler string from step 1 |
+| `DATABASE_CA_CERT` | the certificate text |
+| `JWT_SECRET` | a long random string (32+ characters). Make one with `openssl rand -base64 48` |
+| `CRON_SECRET` | another long random string. Vercel sends it to the scheduled job automatically |
+| `ALLOW_MOCK_PAYMENTS` | `true` (demo: fake payments) |
+| `OPERATOR_EMAILS` | your email, e.g. `you@example.com` |
+| `CORS_ORIGINS`, `API_PUBLIC_URL`, `APP_RETURN_PREFIXES` | `https://placeholder.example` for now; you'll fix these in step 4 |
+
+4. **Deploy.** The build compiles the API, creates the database tables, and adds the demo mosques. When it finishes, note the address, e.g. `https://masjid-api.vercel.app`. Opening `<address>/health` should show `{"ok":true}`. If the build fails at the migration step, the database address or certificate is wrong; the build log says which.
+
+## 3. Vercel project #2: the web app
+
+1. **Add New > Project**, import the same repository again.
+2. Set **Root Directory** to `apps/app`. Leave the framework as "Other". `apps/app/vercel.json` sets the build and makes deep links work on refresh.
+3. Add `EXPO_PUBLIC_API_URL` = the API address from step 2 (no trailing slash). It's baked in at build time, so changing it later means redeploying.
 4. Deploy. Note the address, e.g. `https://masjid-donation.vercel.app`.
 
 ## 4. Point the API at the web app
 
-In Render, edit the environment variables and save (it redeploys):
+In the **API** project's environment variables set:
 
-- `CORS_ORIGINS` = your Vercel address, e.g. `https://masjid-donation.vercel.app`
-- `API_PUBLIC_URL` = your Render address
+- `CORS_ORIGINS` = the web app address, e.g. `https://masjid-donation.vercel.app`
+- `API_PUBLIC_URL` = the API address
 - `APP_RETURN_PREFIXES` = `https://masjid-donation.vercel.app,masjiddonation://`
 
-If you later add a custom domain, add it to `CORS_ORIGINS` too (comma-separated).
+Then **Redeploy** the API project (env var changes apply to new deployments). If you add a custom domain later, add it to `CORS_ORIGINS` too (comma-separated).
 
 ## 5. Try it
 
-Open your Vercel address. Sign up as a donor and look at the demo mosques. Sign up with your `OPERATOR_EMAILS` address to get the Operator console (History tab) for approving organizations.
+Open the web app address. Sign up as a donor and browse the demo mosques. Sign up with your `OPERATOR_EMAILS` address to get the Operator console (History tab) for approving organizations.
 
 ## Things to know
 
-- **Render's free plan sleeps** after ~15 minutes idle and takes about a minute to wake, and recurring-donation processing doesn't run while it sleeps. Fine for a demo; use a paid instance for real use.
-- **Refreshing deep links works** on Vercel because `vercel.json` sends every path to the app.
+- **Scheduled jobs.** Vercel functions can't run a background timer, so `apps/api/vercel.json` schedules `GET /jobs/run` once a day. It charges due recurring donations (they're weekly or monthly, so daily is enough) and finishes settling bank payments. Vercel's free Hobby plan allows cron only once per day; on Pro you can change the schedule in `vercel.json` to hourly (`0 * * * *`). Stripe's webhook handles most payment updates in real time regardless.
+- **Cold starts.** The first request after a quiet period is a bit slower.
+- **Upload size.** Vercel functions accept request bodies up to about 4.5 MB, while the API's limit is 5 MB. A document between those sizes will be rejected by Vercel, so ask organizations to keep letters under 4 MB.
+- **Stripe webhooks on Vercel are untested.** Stripe signs the raw request body, and I couldn't confirm that Vercel's runtime delivers it unmodified. Before going live, send a test event from the Stripe dashboard and check it succeeds. If signature checks fail, run the API on a server host instead (`render.yaml` in this repo does that).
 - **Changing `JWT_SECRET`** signs everyone out.
-- The API refuses to start in production unless the settings above are present, and refuses to run fake payments unless `ALLOW_MOCK_PAYMENTS=true`. That flag is there so a forgotten Stripe key can never silently take "payments" that don't exist.
-- Going live with real payments: remove `ALLOW_MOCK_PAYMENTS`, set `STRIPE_SECRET_KEY` and `STRIPE_WEBHOOK_SECRET`, add the webhook endpoint `<api address>/webhooks/payments` in Stripe, and clear the demo mosques from the database (they exist only because the demo has no Stripe key).
+- The API refuses to start in production unless the required settings are present, and refuses fake payments unless `ALLOW_MOCK_PAYMENTS=true`.
+- Going live with real payments: remove `ALLOW_MOCK_PAYMENTS`, set `STRIPE_SECRET_KEY` and `STRIPE_WEBHOOK_SECRET`, add the webhook endpoint `<api address>/webhooks/payments` in Stripe, and delete the demo mosques from the database (they exist only because the demo has no Stripe key).
+
+## Alternative: API on Render
+
+If you'd rather run the API as an always-on server (background timer every minute, no cold starts, no webhook uncertainty), `render.yaml` is a ready-made blueprint. Use the Supabase **Session pooler** string (not the transaction pooler) there, and skip `CRON_SECRET`.

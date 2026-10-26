@@ -1,0 +1,7 @@
+{
+  "buildCommand": "npm run build && npm run migrate",
+  "outputDirectory": "public",
+  "functions": { "api/index.js": { "maxDuration": 60 } },
+  "rewrites": [{ "source": "/(.*)", "destination": "/api" }],
+  "crons": [{ "path": "/jobs/run", "schedule": "0 12 * * *" }]
+}

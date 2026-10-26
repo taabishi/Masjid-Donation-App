@@ -2,6 +2,7 @@ import express, { type NextFunction, type Request, type Response } from 'express
 import cors from 'cors';
 import jwt from 'jsonwebtoken';
 import bcrypt from 'bcryptjs';
+import { createHash, timingSafeEqual } from 'node:crypto';
 import { z } from 'zod';
 import { newId, type Mosque, type Role, type User } from './types.js';
 import type { PaymentProvider } from './payments.js';
@@ -29,6 +30,10 @@ export interface AppOptions {
   directory?: NonprofitDirectory;
   /** Browser origins allowed to call the API. Empty/omitted = any origin (development only). Native apps send no Origin and are unaffected. */
   corsOrigins?: string[];
+  /** Shared secret for GET /jobs/run (Vercel Cron sends it as `Authorization: Bearer $CRON_SECRET`). */
+  cronSecret?: string;
+  /** Background work to run on /jobs/run. */
+  runJobs?: () => Promise<unknown>;
 }
 
 export function createApp(
@@ -567,6 +572,16 @@ export function createApp(
       await failPayout(repo, payout); // credit the mosque's balance back
       res.status(502).json({ error: 'Transfer failed; the balance was restored.' });
     }
+  });
+
+  // ---------- scheduled jobs (serverless hosts without a background timer) ----------
+  const sha = (s: string) => createHash('sha256').update(s).digest();
+  app.get('/jobs/run', async (req, res) => {
+    const given = String(req.headers.authorization ?? '');
+    if (!opts.cronSecret || !opts.runJobs || !timingSafeEqual(sha(given), sha(`Bearer ${opts.cronSecret}`))) {
+      return res.status(401).json({ error: 'Not allowed' });
+    }
+    res.json(await opts.runJobs());
   });
 
   // Express 5 forwards rejected async handlers here

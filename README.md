@@ -34,7 +34,7 @@ Sign up as "I run a mosque" for the admin panel, or as a donor to give.
 
 The API stores everything in Postgres. In production use a Supabase project:
 
-1. Create a project. Under **Project Settings > Database** copy the **direct connection** string (or the **session pooler** string). Do **not** use the transaction pooler (port 6543): the ledger relies on transactions and row locks.
+1. Create a project. Under **Project Settings > Database** copy a connection string: the **session pooler** or direct connection for an always-on server, or the **transaction pooler** (port 6543) for serverless hosting such as Vercel. (The API uses ordinary transactions and row locks, no named prepared statements, so it works with all three; this has not been verified against Supabase itself.)
 2. Under **Database > Settings > SSL** download the CA certificate. The API verifies TLS, and Supabase's chain is not in the default trust store, so pass the PEM as `DATABASE_CA_CERT`.
 3. Set `DATABASE_URL` (and `DATABASE_CA_CERT`) on the API host. Migrations in `apps/api/migrations` are applied automatically at startup and tracked in `schema_migrations`.
 4. In Supabase, turn on automatic backups and point-in-time recovery (paid plans). This database holds money records.
@@ -51,7 +51,7 @@ The API stores everything in Postgres. In production use a Supabase project:
 
 ## Deploying
 
-See [DEPLOY.md](DEPLOY.md): Supabase (database) + Render (API, `render.yaml`) + Vercel (web app, `apps/app/vercel.json`). The API refuses to start in production without the required settings (`apps/api/src/config.ts`).
+See [DEPLOY.md](DEPLOY.md): Supabase (database) + two Vercel projects (API from `apps/api`, web app from `apps/app`). `render.yaml` is an alternative for running the API as an always-on server. The API refuses to start in production without the required settings (`apps/api/src/config.ts`).
 
 ## Payments (Stripe)
 

@@ -1,54 +1,11 @@
-import Stripe from 'stripe';
-import { createApp } from './app.js';
-import { productionConfigProblems } from './config.js';
-import { createPgDb, createPgliteDb, migrate } from './db.js';
-import { settleUnsettled } from './ledger.js';
-import { MockPaymentProvider, StripePaymentProvider } from './payments.js';
-import { processDueRecurring } from './recurring.js';
-import { Repo } from './repo.js';
-import { seedDemoMosques } from './seed.js';
+import { buildServices } from './bootstrap.js';
+import { runBackgroundJobs } from './jobs.js';
 
-const production = process.env.NODE_ENV === 'production';
-if (production) {
-  const problems = productionConfigProblems(process.env);
-  if (problems.length) throw new Error('Refusing to start in production:\n - ' + problems.join('\n - '));
-}
-const secret = process.env.JWT_SECRET;
+// Long-running server (local development, Render, Railway, Fly...). Applies migrations at startup
+// and runs the background jobs on a timer. On Vercel see serverless.ts instead.
+const { app, repo, payments, port } = await buildServices(process.env, { runMigrations: true, seedDemoData: true });
 
-const port = Number(process.env.PORT ?? 4000);
-const stripeKey = process.env.STRIPE_SECRET_KEY;
-const payments = stripeKey
-  ? new StripePaymentProvider(new Stripe(stripeKey), process.env.STRIPE_WEBHOOK_SECRET)
-  : new MockPaymentProvider();
-console.log(`Payments: ${payments.name}${stripeKey ? '' : ' (set STRIPE_SECRET_KEY for real payments)'}`);
-if (stripeKey && !process.env.STRIPE_WEBHOOK_SECRET) console.warn('STRIPE_WEBHOOK_SECRET not set: bank-debit settlement and account updates will not be received');
-
-// Postgres (e.g. Supabase) when DATABASE_URL is set; otherwise an embedded local Postgres for development.
-const databaseUrl = process.env.DATABASE_URL;
-const db = databaseUrl
-  ? await createPgDb(databaseUrl, { caCert: process.env.DATABASE_CA_CERT, insecureSsl: process.env.DATABASE_SSL_INSECURE === 'true' })
-  : await createPgliteDb(process.env.DATA_DIR ?? 'data/pglite');
-console.log(`Database: ${databaseUrl ? 'Postgres' : 'embedded local Postgres (development only)'}`);
-await migrate(db);
-
-const repo = new Repo(db, db, {
-  passThroughProcessingFees: (process.env.PASS_THROUGH_FEES ?? 'true') === 'true',
-  platformFeeBps: Number(process.env.PLATFORM_FEE_BPS ?? 0),
-});
-// demo mosques only make sense with the mock provider; real mode starts empty
-if (!stripeKey) await seedDemoMosques(repo);
-
-const app = createApp(repo, payments, secret ?? 'dev-only-secret', {
-  apiPublicUrl: process.env.API_PUBLIC_URL ?? `http://localhost:${port}`,
-  allowedReturnPrefixes: (process.env.APP_RETURN_PREFIXES ?? 'http://localhost:8081,masjiddonation://,exp://').split(','),
-  corsOrigins: (process.env.CORS_ORIGINS ?? '').split(',').map((o) => o.trim()).filter(Boolean),
-  operatorEmails: (process.env.OPERATOR_EMAILS ?? '').split(',').map((e) => e.trim().toLowerCase()).filter(Boolean),
-});
-
-const tick = () =>
-  processDueRecurring(repo, payments)
-    .then(() => settleUnsettled(repo, payments))
-    .catch((e) => console.error('background run failed', e));
+const tick = () => runBackgroundJobs(repo, payments).catch((e) => console.error('background run failed', e));
 setInterval(tick, 60_000);
 void tick();
 

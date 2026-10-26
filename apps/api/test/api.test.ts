@@ -289,3 +289,25 @@ test('verification documents: type checks, size of set, operator-only download',
   assert.deepEqual(got.bytes, pdf);
   await close();
 });
+
+test('/jobs/run only accepts the cron secret', async () => {
+  const { repo, payments, close } = await setup();
+  let runs = 0;
+  const server = createApp(repo, payments, 'test', {
+    apiPublicUrl: 'http://localhost', allowedReturnPrefixes: [], operatorEmails: [], directory: stubDirectory,
+    cronSecret: 's3cret', runJobs: async () => ({ ran: ++runs }),
+  }).listen(0);
+  const base = `http://localhost:${(server.address() as AddressInfo).port}`;
+  assert.equal((await fetch(base + '/jobs/run')).status, 401);
+  assert.equal((await fetch(base + '/jobs/run', { headers: { authorization: 'Bearer wrong' } })).status, 401);
+  const ok = await fetch(base + '/jobs/run', { headers: { authorization: 'Bearer s3cret' } });
+  assert.equal(ok.status, 200);
+  assert.deepEqual(await ok.json(), { ran: 1 });
+  assert.equal(runs, 1);
+  server.close();
+  // with no secret configured the endpoint is closed to everyone
+  const { call, close: close2 } = await setup();
+  assert.equal((await call('GET', '/jobs/run')).status, 401);
+  await close2();
+  await close();
+});

@@ -35,18 +35,19 @@ export async function createPgliteDb(dataDir?: string): Promise<Db> {
 }
 
 /**
- * Postgres over the network, e.g. Supabase. Use the "direct connection" or "session pooler" string
- * (not the transaction pooler: we rely on transactions and row locks on a single connection).
+ * Postgres over the network, e.g. Supabase. Works with the direct connection, the session pooler, and the
+ * transaction pooler (we use ordinary transactions and row locks, no named prepared statements or session state).
+ * Serverless hosts (Vercel) should use the transaction pooler; always-on servers the session pooler or direct.
  *
  * TLS is verified. Supabase's certificate chain is not in the system trust store, so set
  * DATABASE_CA_CERT to the PEM from the Supabase dashboard (Database > Settings > SSL).
  */
-export async function createPgDb(connectionString: string, opts: { caCert?: string; insecureSsl?: boolean } = {}): Promise<Db> {
+export async function createPgDb(connectionString: string, opts: { caCert?: string; insecureSsl?: boolean; maxConnections?: number } = {}): Promise<Db> {
   const pg = await import('pg');
   // `?sslmode=disable` is the only way to turn TLS off (local development servers)
   const noTls = new URL(connectionString).searchParams.get('sslmode') === 'disable';
   const ssl = noTls ? false : opts.insecureSsl ? { rejectUnauthorized: false } : opts.caCert ? { ca: opts.caCert } : true;
-  const pool = new pg.default.Pool({ connectionString: stripSslParams(connectionString), ssl, max: 10 });
+  const pool = new pg.default.Pool({ connectionString: stripSslParams(connectionString), ssl, max: opts.maxConnections ?? 10 });
   const wrap = (h: { query: (sql: string, params?: unknown[]) => Promise<{ rows: unknown[] }> }): Queryable => ({
     query: async (sql, params) => ({ rows: (await h.query(sql, params)).rows as never[] }),
     exec: async (sql) => void (await h.query(sql)),

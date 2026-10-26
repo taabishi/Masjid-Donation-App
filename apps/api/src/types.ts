@@ -1,7 +1,9 @@
 import { randomUUID } from 'node:crypto';
+import type { EinLookup } from './directory.js';
 
 export type Role = 'donor' | 'admin';
 export type Frequency = 'weekly' | 'monthly';
+export type VerificationStatus = 'unverified' | 'pending_review' | 'verified' | 'rejected';
 
 export interface User {
   id: string;
@@ -29,6 +31,12 @@ export interface Mosque {
   causes: Cause[];
   payoutsConnected: boolean;
   payoutAccountId?: string;
+  /** Only 'verified' organizations can receive donations or payouts. */
+  verificationStatus: VerificationStatus;
+  ein?: string;
+  legalName?: string;
+  verificationNote?: string;
+  einLookup?: EinLookup;
 }
 
 export interface Donation {

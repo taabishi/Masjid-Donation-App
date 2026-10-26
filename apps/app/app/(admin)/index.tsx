@@ -1,7 +1,7 @@
-import { useFocusEffect } from 'expo-router';
+import { useFocusEffect, useRouter } from 'expo-router';
 import { useCallback, useState } from 'react';
 import { Text, View } from 'react-native';
-import { api, type AdminReport, type Mosque } from '../../src/api';
+import { api, type AdminReport, type Mosque, type VerificationStatus } from '../../src/api';
 import { useAuth } from '../../src/auth';
 import { openHosted, returnUrl } from '../../src/hosted';
 import { cents, colors } from '../../src/theme';
@@ -16,7 +16,8 @@ const Stat = ({ label, value }: { label: string; value: string }) => (
 
 export default function Dashboard() {
   const { signOut } = useAuth();
-  const [mosque, setMosque] = useState<(Mosque & { payoutsConnected: boolean }) | null>(null);
+  const router = useRouter();
+  const [mosque, setMosque] = useState<(Mosque & { payoutsConnected: boolean; verificationStatus: VerificationStatus }) | null>(null);
   const [report, setReport] = useState<AdminReport | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [busy, setBusy] = useState(false);
@@ -48,7 +49,18 @@ export default function Dashboard() {
     <Screen>
       <H1>{mosque.name}</H1>
       <ErrorText>{error}</ErrorText>
-      {!mosque.payoutsConnected ? (
+      {mosque.verificationStatus !== 'verified' && (
+        <Card style={{ borderColor: colors.gold }}>
+          <Text style={{ fontWeight: '700' }}>
+            {mosque.verificationStatus === 'pending_review' ? 'Verification in review' : mosque.verificationStatus === 'rejected' ? 'Verification needs changes' : 'Verify your organization'}
+          </Text>
+          <Muted style={{ marginVertical: 8 }}>
+            Donors can find you and give once we've confirmed your organization's tax-exempt status. It only takes your EIN and, if you have one, your IRS determination letter.
+          </Muted>
+          <Button title={mosque.verificationStatus === 'pending_review' ? 'View status' : 'Verify now'} onPress={() => router.push('/(admin)/verification')} />
+        </Card>
+      )}
+      {mosque.verificationStatus !== 'verified' ? null : !mosque.payoutsConnected ? (
         <Card style={{ borderColor: colors.gold }}>
           <Text style={{ fontWeight: '700' }}>Donations are already being collected for you</Text>
           <Muted style={{ marginVertical: 8 }}>

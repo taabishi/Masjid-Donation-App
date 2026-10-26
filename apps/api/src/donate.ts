@@ -27,6 +27,8 @@ export async function chargeDonation(
   },
 ): Promise<DonateOutcome> {
   const { user, mosque } = opts;
+  // defense in depth: callers already check, but money must never be taken for an unverified organization
+  if (mosque.verificationStatus !== 'verified') return { ok: false, code: 'payment_failed', error: 'This organization is not accepting donations yet' };
   const noMethod = { ok: false as const, code: 'no_payment_method' as const, error: 'Add a payment method first' };
   if (!user.paymentCustomerId) return noMethod;
 

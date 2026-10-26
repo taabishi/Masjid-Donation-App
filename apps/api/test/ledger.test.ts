@@ -8,7 +8,7 @@ import { newRepo } from './helpers.js';
 async function setup(policy?: Partial<import('../src/types.js').FeePolicy>) {
   const { repo, db } = await newRepo({ policy });
   const mosqueId = newId();
-  await repo.createMosque({ id: mosqueId, name: 'M', city: 'C', state: 'S', address: '', description: '', causes: [], payoutsConnected: false });
+  await repo.createMosque({ id: mosqueId, name: 'M', city: 'C', state: 'S', address: '', description: '', causes: [], payoutsConnected: false, verificationStatus: 'verified' });
   const userId = newId();
   await repo.createUser({ id: userId, name: 'U', email: `${userId}@x.test`, passwordHash: 'x', role: 'donor' });
   const mk = (amountCents: number, status: Donation['status'] = 'succeeded', paymentRef = 'ref_' + newId()) =>

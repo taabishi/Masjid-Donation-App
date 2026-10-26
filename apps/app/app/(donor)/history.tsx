@@ -1,4 +1,4 @@
-import { useFocusEffect } from 'expo-router';
+import { useFocusEffect, useRouter } from 'expo-router';
 import { useCallback, useState } from 'react';
 import { Text, View } from 'react-native';
 import { api, type Donation } from '../../src/api';
@@ -8,6 +8,7 @@ import { Button, Card, ErrorText, H2, Loading, Muted, Screen } from '../../src/u
 
 export default function History() {
   const { user, signOut } = useAuth();
+  const router = useRouter();
   const [items, setItems] = useState<Donation[] | null>(null);
   const [error, setError] = useState<string | null>(null);
 
@@ -24,6 +25,7 @@ export default function History() {
       <Card>
         <Text style={{ fontWeight: '700' }}>{user?.name}</Text>
         <Muted style={{ marginBottom: 12 }}>{user?.email}</Muted>
+        {user?.operator && <Button title="Operator console" onPress={() => router.push('/ops')} style={{ marginBottom: 8 }} />}
         <Button title="Sign out" variant="outline" onPress={signOut} />
       </Card>
       <H2>Total given: {cents(total)}</H2>

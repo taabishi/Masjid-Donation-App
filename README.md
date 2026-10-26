@@ -3,7 +3,8 @@
 A digital donation box for the mosques you visit. One codebase runs on iPhone, Android and the web.
 
 - **Donors**: favorite mosques, one-tap donations ($5 / $10 / $15 / $25 / custom, $5 minimum), optional cause, recurring (weekly/monthly) giving, history.
-- **Mosque admins**: public profile, causes being collected for, payout setup, dashboard of incoming donations.
+- **Mosque admins**: verify their organization, public profile, causes being collected for, payout setup, dashboard of incoming donations.
+- **Platform operators** (allow-listed emails): review organization verifications, see balances owed, pay mosques out.
 
 ## Layout
 
@@ -85,16 +86,31 @@ Operator endpoints (bearer token of an `OPERATOR_EMAILS` user):
 |---|---|
 | `GET /ops/balances` | Owed per mosque, onboarding status, platform's own balance |
 | `GET /ops/ledger?account=` | Latest ledger entries |
+| `GET /ops/verifications?status=` and `POST /ops/verifications/:mosqueId` | Review queue (see above) |
 | `POST /ops/payouts` `{mosqueId, amountCents, method, reference?}` | `stripe_transfer` (mosque must be onboarded) or `ach_manual` (you sent the ACH from your bank; record the trace number). Money is reserved in the ledger first, so it can't be paid twice, and restored if a transfer fails |
 | `GET /ops/reconcile?bankCents=` | Compares the ledger with Stripe's balance (+ any donation money you hold in your bank). Should be ~0 |
+
+## Organization verification
+
+Only verified tax-exempt organizations can appear to donors, receive donations, connect Stripe payouts, or be paid out. (In mock mode the seeded demo mosques are pre-verified.)
+
+1. A mosque admin opens the **Verification** tab, enters the legal name and EIN, and optionally uploads an IRS determination letter (PDF/PNG/JPEG, max 5 MB, up to 5 files; stored in the database, content type checked against the file's bytes).
+2. The API looks the EIN up in the tax-exempt directory (ProPublica Nonprofit Explorer, `apps/api/src/directory.ts`) and records what it found: official name, name match, state match, whether the IRS subsection is 501(c)(3). This is only a hint for the reviewer. **Nothing is ever auto-approved**, because anyone can type someone else's EIN. If the directory is down or doesn't know the EIN the application still goes to review.
+3. An operator reviews the queue in the app (**History > Operator console**, web recommended so documents can be opened) or via `GET /ops/verifications`, then approves or rejects (`POST /ops/verifications/:mosqueId`; a rejection needs a reason, which is shown to the organization, which can then fix and resubmit). Every submission and decision is recorded in `verification_events`.
+4. One EIN can only be claimed by one organization account at a time (pending or approved), enforced by a database index. A verified organization's EIN is locked.
+
+**Houses of worship** are generally treated as tax-exempt without applying to the IRS or filing a Form 990, so many mosques will not appear in IRS data. For those the reviewer relies on documents (an IRS determination or affirmation letter, etc.). Confirm your review policy with your nonprofit lawyer, and consider re-checking organizations periodically (not automated yet).
+
+Operator checklist when approving: the EIN, legal name and city/state belong to the applicant; the person who signed up plausibly represents the organization (email domain, website, phone call); the IRS record, if any, shows 501(c)(3) status and is not revoked.
 
 ## Before real money
 
 - **Get legal advice first.** Holding donations for organizations that haven't onboarded can involve money-transmitter rules, state charitable-solicitation registration, and tax-receipt questions (a gift to the platform is not automatically deductible). Tell Stripe your exact model when applying.
-- Self-registered mosques are not verified yet: payouts are operator-gated, but EIN / 501(c)(3) verification (IRS data, ProPublica API, determination-letter upload, review queue) is still to build.
+- The reviewer decides who is a legitimate organization. Write down your review policy, and make sure at least one person other than the developer is trained to apply it.
 
 ## What is NOT production-ready yet
 
+- **The ProPublica lookup has not been run against the live API** (it is unreachable from the development sandbox). Its response parsing follows the documented v2 shape and is unit-tested against that shape; verify it with a real EIN before relying on the hints it gives reviewers.
 - **The Stripe integration has not been run against Stripe.** It is covered by unit tests with a fake Stripe client (request parameters, fee extraction, transfers, error mapping, webhooks) and the mock provider is exercised end to end, but test it with Stripe test keys before relying on it.
 - Reconciliation can show a small persistent difference: Stripe dispute fees and refund fees are not ledgered yet. Disputes and refunds reduce the mosque's balance by the gross amount only.
 - Off-session charges that need 3-D Secure fail with a message asking the donor to re-add the method.

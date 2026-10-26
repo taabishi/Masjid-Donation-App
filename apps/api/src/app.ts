@@ -8,6 +8,7 @@ import type { PaymentProvider } from './payments.js';
 import { chargeDonation } from './donate.js';
 import { completePayout, createPayout, failPayout, PayoutError, PLATFORM, reconcile, recordDispute, recordRefund, settleDonation } from './ledger.js';
 import { isUniqueViolation, type MosqueWithFavorite, type Repo } from './repo.js';
+import { checkEin, formatEin, normalizeEin, ProPublicaDirectory, type NonprofitDirectory } from './directory.js';
 
 // Card fees are ~2.9% + 30c, so tiny gifts lose a large share to fees. Keep in sync with the app.
 const MIN_CENTS = 500; // $5
@@ -22,8 +23,10 @@ export interface AppOptions {
   apiPublicUrl: string;
   /** URL prefixes the return page may redirect back to (web app origin, native deep-link schemes). */
   allowedReturnPrefixes: string[];
-  /** Emails allowed to use the /ops platform-operator endpoints (balances, payouts, reconciliation). */
+  /** Emails allowed to use the /ops platform-operator endpoints (balances, payouts, reconciliation, verification). */
   operatorEmails: string[];
+  /** Tax-exempt directory used to pre-check EINs for the reviewer. */
+  directory?: NonprofitDirectory;
 }
 
 export function createApp(
@@ -72,7 +75,9 @@ export function createApp(
 
   app.use(express.json());
 
-  const publicUser = (u: User) => ({ id: u.id, name: u.name, email: u.email, role: u.role, mosqueId: u.mosqueId });
+  const directory = opts.directory ?? new ProPublicaDirectory();
+  const isOperator = (u: User) => opts.operatorEmails.includes(u.email);
+  const publicUser = (u: User) => ({ id: u.id, name: u.name, email: u.email, role: u.role, mosqueId: u.mosqueId, operator: isOperator(u) });
   const sign = (u: User) => jwt.sign({ sub: u.id }, jwtSecret, { expiresIn: '30d' });
 
   const auth = (role?: Role) => async (req: AuthedRequest, res: Response, next: NextFunction) => {
@@ -108,7 +113,8 @@ export function createApp(
     address: m.address,
     description: m.description,
     causes: m.causes,
-    acceptingDonations: true, // the platform collects on every mosque's behalf; payouts are tracked separately
+    // only verified organizations can receive donations; the platform collects on their behalf and pays out later
+    acceptingDonations: m.verificationStatus === 'verified',
     isFavorite: m.isFavorite,
   });
 
@@ -148,6 +154,7 @@ export function createApp(
             ...body.mosque,
             causes: [{ id: newId(), title: 'General Fund', description: 'Day-to-day operations and upkeep.' }],
             payoutsConnected: false,
+            verificationStatus: 'unverified',
           };
           await tx.createMosque(mosque);
           user.mosqueId = mosque.id;
@@ -257,6 +264,7 @@ export function createApp(
   const checkTarget = async (mosqueId: string, causeId: string | undefined, res: Response) => {
     const mosque = await repo.getMosque(mosqueId);
     if (!mosque) return void res.status(404).json({ error: 'Mosque not found' });
+    if (mosque.verificationStatus !== 'verified') return void res.status(409).json({ error: 'This organization is not accepting donations yet', code: 'not_accepting' });
     if (causeId && !mosque.causes.some((c) => c.id === causeId)) return void res.status(400).json({ error: 'Unknown cause' });
     return mosque;
   };
@@ -339,7 +347,7 @@ export function createApp(
         console.error('payout status check failed', e);
       }
     }
-    res.json({ ...mosqueView(m), payoutsConnected: m.payoutsConnected });
+    res.json({ ...mosqueView(m), payoutsConnected: m.payoutsConnected, verificationStatus: m.verificationStatus });
   });
 
   app.put('/admin/mosque', auth('admin'), async (req: AuthedRequest, res) => {
@@ -364,6 +372,7 @@ export function createApp(
     const body = parse(returnSchema, req.body, res);
     if (!body) return;
     const m = await adminMosque(req);
+    if (m.verificationStatus !== 'verified') return res.status(409).json({ error: 'Your organization must be verified before connecting payouts.' });
     const step = await payments.beginMosqueOnboarding(m, returnLink(body.returnUrl));
     const connected = step.url ? m.payoutsConnected : await payments.isMosqueReady(step.accountId);
     await repo.setMosquePayout(m.id, step.accountId, connected);
@@ -405,6 +414,62 @@ export function createApp(
     });
   });
 
+  // ---------- verification (mosque admin) ----------
+  const MAX_DOC_BYTES = 5 * 1024 * 1024;
+  const MAX_DOCS = 5;
+  const DOC_TYPES: Record<string, (b: Buffer) => boolean> = {
+    'application/pdf': (b) => b.subarray(0, 5).toString('latin1') === '%PDF-',
+    'image/png': (b) => b.subarray(0, 4).equals(Buffer.from([0x89, 0x50, 0x4e, 0x47])),
+    'image/jpeg': (b) => b.subarray(0, 3).equals(Buffer.from([0xff, 0xd8, 0xff])),
+  };
+
+  const verificationView = async (m: MosqueWithFavorite) => ({
+    status: m.verificationStatus,
+    note: m.verificationNote,
+    ein: m.ein ? formatEin(m.ein) : undefined,
+    legalName: m.legalName,
+    lookup: m.einLookup,
+    documents: (await repo.listDocuments(m.id)).map(({ id, filename, createdAt }) => ({ id, filename, createdAt })),
+  });
+
+  app.get('/admin/verification', auth('admin'), async (req: AuthedRequest, res) => {
+    res.json(await verificationView(await adminMosque(req)));
+  });
+
+  const verificationSchema = z.object({ ein: z.string(), legalName: z.string().trim().min(1).max(200) });
+
+  app.post('/admin/verification', auth('admin'), async (req: AuthedRequest, res) => {
+    const body = parse(verificationSchema, req.body, res);
+    if (!body) return;
+    const ein = normalizeEin(body.ein);
+    if (!ein) return res.status(400).json({ error: 'Enter a 9-digit EIN, e.g. 12-3456789' });
+    const m = await adminMosque(req);
+    if (m.verificationStatus === 'verified') return res.status(409).json({ error: 'Already verified. Contact support to change your EIN.' });
+    const lookup = await checkEin(directory, ein, body.legalName, m.state);
+    try {
+      await repo.submitVerification(m.id, req.user!.id, { ein, legalName: body.legalName, lookup });
+    } catch (e) {
+      if (isUniqueViolation(e)) return res.status(409).json({ error: 'This EIN is already registered by another account. Contact support if that is a mistake.' });
+      throw e;
+    }
+    res.status(201).json(await verificationView((await adminMosque(req))!));
+  });
+
+  // Upload a determination letter or other proof. Raw bytes in the body, Content-Type set to the file's type, X-Filename header.
+  app.post('/admin/verification/documents', auth('admin'), express.raw({ type: Object.keys(DOC_TYPES), limit: MAX_DOC_BYTES }), async (req: AuthedRequest, res) => {
+    const m = await adminMosque(req);
+    if (m.verificationStatus === 'verified') return res.status(409).json({ error: 'Already verified' });
+    const type = String(req.headers['content-type'] ?? '').split(';')[0].trim();
+    const data = req.body as Buffer;
+    if (!DOC_TYPES[type] || !Buffer.isBuffer(data) || !data.length) return res.status(415).json({ error: 'Upload a PDF, PNG or JPEG file' });
+    if (!DOC_TYPES[type](data)) return res.status(415).json({ error: 'File contents do not match its type' });
+    if ((await repo.listDocuments(m.id)).length >= MAX_DOCS) return res.status(409).json({ error: `At most ${MAX_DOCS} documents` });
+    const filename = String(req.headers['x-filename'] ?? 'document').replace(/[^\w.\- ]+/g, '_').slice(0, 100) || 'document';
+    const id = newId();
+    await repo.addDocument(m.id, { id, filename, contentType: type, data });
+    res.status(201).json({ id, filename });
+  });
+
   // ---------- platform operator ----------
   const operator = (req: AuthedRequest, res: Response, next: NextFunction) =>
     opts.operatorEmails.includes(req.user!.email) ? next() : void res.status(403).json({ error: 'Not allowed' });
@@ -418,6 +483,38 @@ export function createApp(
       payoutsConnected: m.payoutsConnected,
     }));
     res.json({ mosques: rows, platformCents: balances.get(PLATFORM) ?? 0, totalOwedCents: rows.reduce((s, r) => s + r.owedCents, 0) });
+  });
+
+  app.get('/ops/verifications', auth(), operator, async (req, res) => {
+    const status = ['pending_review', 'verified', 'rejected', 'unverified'].includes(String(req.query.status)) ? String(req.query.status) : 'pending_review';
+    const rows = await repo.verificationQueue(status);
+    res.json(
+      rows.map((m) => ({
+        mosqueId: m.id, name: m.name, city: m.city, state: m.state, adminEmail: m.adminEmail, status: m.verificationStatus,
+        ein: m.ein ? formatEin(m.ein) : undefined, legalName: m.legalName, lookup: m.einLookup, note: m.verificationNote,
+        submittedAt: m.submittedAt, documents: m.documents.map(({ id, filename, contentType, sizeBytes }) => ({ id, filename, contentType, sizeBytes })),
+      })),
+    );
+  });
+
+  app.get('/ops/verifications/:mosqueId/documents/:docId', auth(), operator, async (req, res) => {
+    const doc = await repo.getDocument(String(req.params.mosqueId), String(req.params.docId));
+    if (!doc) return res.status(404).json({ error: 'Not found' });
+    res
+      .set({ 'content-type': doc.contentType, 'content-disposition': `attachment; filename="${doc.filename.replace(/"/g, '')}"`, 'x-content-type-options': 'nosniff' })
+      .send(doc.data);
+  });
+
+  const decisionSchema = z.object({ decision: z.enum(['approve', 'reject']), note: z.string().trim().max(1000).optional() });
+
+  app.post('/ops/verifications/:mosqueId', auth(), operator, async (req: AuthedRequest, res) => {
+    const body = parse(decisionSchema, req.body, res);
+    if (!body) return;
+    if (body.decision === 'reject' && !body.note) return res.status(400).json({ error: 'Give a reason when rejecting, so the organization knows what to fix' });
+    if (!(await repo.decideVerification(String(req.params.mosqueId), req.user!.id, body.decision, body.note))) {
+      return res.status(409).json({ error: 'This organization is not awaiting review' });
+    }
+    res.json({ ok: true });
   });
 
   app.get('/ops/ledger', auth(), operator, async (req, res) => {
@@ -441,6 +538,7 @@ export function createApp(
     if (!body) return;
     const mosque = await repo.getMosque(body.mosqueId);
     if (!mosque) return res.status(404).json({ error: 'Mosque not found' });
+    if (mosque.verificationStatus !== 'verified') return res.status(409).json({ error: 'This organization is not verified.' });
     if (body.method === 'stripe_transfer' && !(mosque.payoutsConnected && mosque.payoutAccountId)) {
       return res.status(409).json({ error: 'This mosque has not finished payout onboarding. Use ach_manual or wait for onboarding.' });
     }
@@ -469,6 +567,8 @@ export function createApp(
 
   // Express 5 forwards rejected async handlers here
   app.use((err: unknown, _req: Request, res: Response, _next: NextFunction) => {
+    const status = (err as { status?: number }).status;
+    if (status && status >= 400 && status < 500) return void res.status(status).json({ error: status === 413 ? 'File too large' : 'Bad request' });
     console.error('unhandled error', err);
     res.status(500).json({ error: 'Something went wrong' });
   });

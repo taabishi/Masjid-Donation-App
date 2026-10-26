@@ -16,7 +16,7 @@ function Guard() {
       if (group !== 'login' && group !== 'register') router.replace('/login');
     } else if (user.role === 'admin') {
       if (group !== '(admin)') router.replace('/(admin)');
-    } else if (group !== '(donor)' && group !== 'mosque') {
+    } else if (group !== '(donor)' && group !== 'mosque' && !(group === 'ops' && user.operator)) {
       router.replace('/(donor)');
     }
   }, [user, loading, group, router]);

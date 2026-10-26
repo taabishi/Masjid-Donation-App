@@ -1,4 +1,5 @@
 import type { Db, Queryable } from './db.js';
+import type { EinLookup } from './directory.js';
 import { newId } from './types.js';
 import type { Cause, Donation, FeePolicy, Frequency, LedgerEntry, LedgerType, Mosque, Payout, Recurring, Role, User } from './types.js';
 
@@ -37,7 +38,7 @@ export const isUniqueViolation = (e: unknown) => (e as { code?: string })?.code 
 /** Typed access to the database. All SQL lives here. */
 export class Repo {
   constructor(
-    private q: Queryable,
+    readonly q: Queryable,
     private db: Db,
     public policy: FeePolicy = { passThroughProcessingFees: true, platformFeeBps: 0 },
   ) {}
@@ -88,18 +89,21 @@ export class Repo {
     return rows.map((r) => ({
       id: r.id, name: r.name, city: r.city, state: r.state, address: r.address, description: r.description,
       causes: byMosque.get(r.id) ?? [], payoutsConnected: r.payouts_connected, payoutAccountId: r.payout_account_id ?? undefined,
+      verificationStatus: r.verification_status, ein: r.ein ?? undefined, legalName: r.legal_name ?? undefined,
+      verificationNote: r.verification_note ?? undefined, einLookup: r.ein_lookup ?? undefined,
       isFavorite: !!r.is_favorite,
     }));
   }
 
   private static FAV = 'EXISTS (SELECT 1 FROM favorites f WHERE f.user_id = $1 AND f.mosque_id = m.id) AS is_favorite';
 
-  /** `userId` only decides the isFavorite flag. */
+  /** Donor discovery: verified organizations only. `userId` only decides the isFavorite flag. */
   async searchMosques(search: string, userId: string | null) {
     const like = `%${search.toLowerCase().replace(/[\\%_]/g, '\\$&')}%`;
     const { rows } = await this.q.query(
       `SELECT m.*, ${Repo.FAV} FROM mosques m
-       WHERE lower(m.name) LIKE $2 OR lower(m.city) LIKE $2 OR lower(m.state) LIKE $2 ORDER BY m.name`,
+       WHERE m.verification_status = 'verified' AND (lower(m.name) LIKE $2 OR lower(m.city) LIKE $2 OR lower(m.state) LIKE $2)
+       ORDER BY m.name`,
       [userId, like],
     );
     return this.withCauses(rows);
@@ -121,8 +125,9 @@ export class Repo {
   }
   async createMosque(m: Omit<Mosque, 'causes'> & { causes: Cause[] }) {
     await this.q.query(
-      'INSERT INTO mosques (id, name, city, state, address, description, payouts_connected, payout_account_id) VALUES ($1,$2,$3,$4,$5,$6,$7,$8)',
-      [m.id, m.name, m.city, m.state, m.address, m.description, m.payoutsConnected, m.payoutAccountId ?? null],
+      `INSERT INTO mosques (id, name, city, state, address, description, payouts_connected, payout_account_id, verification_status, verified_at)
+       VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9, CASE WHEN $9 = 'verified' THEN now() END)`,
+      [m.id, m.name, m.city, m.state, m.address, m.description, m.payoutsConnected, m.payoutAccountId ?? null, m.verificationStatus],
     );
     for (const c of m.causes) await this.addCause(m.id, c);
   }
@@ -141,6 +146,76 @@ export class Repo {
   }
   async deleteCause(mosqueId: string, id: string) {
     await this.q.query('DELETE FROM causes WHERE id=$1 AND mosque_id=$2', [id, mosqueId]);
+  }
+
+  // ---------- verification ----------
+  /**
+   * Record an organization's EIN claim and queue it for human review. Throws a unique violation if another
+   * organization already has a pending/approved claim on this EIN. Not allowed once verified.
+   */
+  async submitVerification(mosqueId: string, actorId: string, v: { ein: string; legalName: string; lookup: EinLookup }) {
+    return this.transaction(async (tx) => {
+      const { rows } = await tx.q.query(
+        `UPDATE mosques SET ein=$2, legal_name=$3, ein_lookup=$4::jsonb, verification_status='pending_review',
+                verification_note=NULL, verification_submitted_at=now()
+         WHERE id=$1 AND verification_status <> 'verified' RETURNING id`,
+        [mosqueId, v.ein, v.legalName, JSON.stringify(v.lookup)],
+      );
+      if (!rows.length) return false;
+      await tx.q.query(`INSERT INTO verification_events (id, mosque_id, action, actor_id) VALUES ($1,$2,'submitted',$3)`, [newId(), mosqueId, actorId]);
+      return true;
+    });
+  }
+  /** Approve or reject a pending claim. Returns false if the mosque isn't awaiting review. */
+  async decideVerification(mosqueId: string, actorId: string, decision: 'approve' | 'reject', note: string | undefined) {
+    return this.transaction(async (tx) => {
+      const { rows } = await tx.q.query(
+        `UPDATE mosques SET verification_status = $2, verification_note = $3, verified_at = CASE WHEN $2 = 'verified' THEN now() END
+         WHERE id = $1 AND verification_status = 'pending_review' RETURNING id`,
+        [mosqueId, decision === 'approve' ? 'verified' : 'rejected', note ?? null],
+      );
+      if (!rows.length) return false;
+      await tx.q.query(`INSERT INTO verification_events (id, mosque_id, action, actor_id, note) VALUES ($1,$2,$3,$4,$5)`, [
+        newId(), mosqueId, decision === 'approve' ? 'approved' : 'rejected', actorId, note ?? null,
+      ]);
+      return true;
+    });
+  }
+  async verificationQueue(status: string) {
+    const { rows } = await this.q.query(
+      `SELECT m.*, false AS is_favorite, m.verification_submitted_at AS submitted_at,
+              (SELECT u.email FROM users u WHERE u.mosque_id = m.id ORDER BY u.created_at LIMIT 1) AS admin_email
+       FROM mosques m WHERE m.verification_status = $1 ORDER BY m.verification_submitted_at NULLS LAST`,
+      [status],
+    );
+    const mosques = await this.withCauses(rows);
+    const out = [];
+    for (const [i, m] of mosques.entries()) {
+      out.push({ ...m, submittedAt: rows[i].submitted_at ? iso(rows[i].submitted_at) : undefined, adminEmail: rows[i].admin_email as string | undefined, documents: await this.listDocuments(m.id) });
+    }
+    return out;
+  }
+  async verificationHistory(mosqueId: string) {
+    const { rows } = await this.q.query(
+      `SELECT e.action, e.note, e.created_at, u.email AS actor FROM verification_events e LEFT JOIN users u ON u.id = e.actor_id
+       WHERE e.mosque_id = $1 ORDER BY e.created_at`,
+      [mosqueId],
+    );
+    return rows.map((r) => ({ action: r.action as string, note: (r.note ?? undefined) as string | undefined, at: iso(r.created_at), actor: (r.actor ?? undefined) as string | undefined }));
+  }
+  async addDocument(mosqueId: string, d: { id: string; filename: string; contentType: string; data: Buffer }) {
+    await this.q.query(
+      'INSERT INTO verification_documents (id, mosque_id, filename, content_type, size_bytes, data) VALUES ($1,$2,$3,$4,$5,$6)',
+      [d.id, mosqueId, d.filename, d.contentType, d.data.length, d.data],
+    );
+  }
+  async listDocuments(mosqueId: string) {
+    const { rows } = await this.q.query('SELECT id, filename, content_type, size_bytes, created_at FROM verification_documents WHERE mosque_id=$1 ORDER BY created_at', [mosqueId]);
+    return rows.map((r) => ({ id: r.id as string, filename: r.filename as string, contentType: r.content_type as string, sizeBytes: num(r.size_bytes), createdAt: iso(r.created_at) }));
+  }
+  async getDocument(mosqueId: string, id: string) {
+    const { rows } = await this.q.query('SELECT filename, content_type, data FROM verification_documents WHERE id=$1 AND mosque_id=$2', [id, mosqueId]);
+    return rows[0] ? { filename: rows[0].filename as string, contentType: rows[0].content_type as string, data: Buffer.from(rows[0].data) } : undefined;
   }
 
   // ---------- favorites ----------

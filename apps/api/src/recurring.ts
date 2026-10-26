@@ -26,6 +26,7 @@ export async function processDueRecurring(repo: Repo, payments: PaymentProvider,
       await repo.deactivateRecurring(r.id);
       continue;
     }
+    // an organization that is no longer verified is skipped (nothing is charged) and the schedule moves on
     try {
       // the key is stable per schedule + due date, so retrying after an outage (or a second server
       // instance running the same sweep) can't double-charge: Stripe returns the same payment and

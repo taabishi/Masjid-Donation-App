@@ -9,6 +9,7 @@ export async function seedDemoMosques(repo: Repo) {
       id: newId(), name, city, state, address, description,
       causes: causes.map(([title, d]) => ({ id: newId(), title, description: d })),
       payoutsConnected: true,
+      verificationStatus: 'verified',
       payoutAccountId: 'acct_demo_' + name.replace(/\W/g, '').toLowerCase(),
     });
   await mk('Masjid Al-Noor', 'Dearborn', 'MI', '123 Ford Rd', 'A community masjid serving families since 1985.', [

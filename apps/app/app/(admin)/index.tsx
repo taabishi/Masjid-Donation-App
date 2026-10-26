@@ -50,19 +50,37 @@ export default function Dashboard() {
       <ErrorText>{error}</ErrorText>
       {!mosque.payoutsConnected ? (
         <Card style={{ borderColor: colors.gold }}>
-          <Text style={{ fontWeight: '700' }}>Set up payouts to start receiving donations</Text>
-          <Muted style={{ marginVertical: 8 }}>Donors can't give until your organization is verified and your bank account is connected. You'll finish this on Stripe's secure page.</Muted>
+          <Text style={{ fontWeight: '700' }}>Donations are already being collected for you</Text>
+          <Muted style={{ marginVertical: 8 }}>
+            Connect your bank account on Stripe's secure page so we can send you the balance below automatically. Until then, we'll arrange payment with you directly.
+          </Muted>
           <Button title="Connect payout account" busy={busy} onPress={connect} />
         </Card>
       ) : (
-        <Card style={{ backgroundColor: colors.primarySoft }}><Text style={{ color: colors.primaryDark, fontWeight: '600' }}>✓ Payouts connected — accepting donations</Text></Card>
+        <Card style={{ backgroundColor: colors.primarySoft }}><Text style={{ color: colors.primaryDark, fontWeight: '600' }}>✓ Payout account connected</Text></Card>
       )}
       <View style={{ flexDirection: 'row', flexWrap: 'wrap', gap: 12, marginBottom: 12 }}>
-        <Stat label="This month" value={cents(summary.thisMonthCents)} />
-        <Stat label="All time" value={cents(summary.totalCents)} />
+        <Stat label="Balance waiting for you" value={cents(summary.balanceCents)} />
+        <Stat label="This month (gross)" value={cents(summary.thisMonthCents)} />
+        <Stat label="All time (gross)" value={cents(summary.totalCents)} />
         <Stat label="Donations" value={String(summary.donationCount)} />
         <Stat label="Active recurring" value={String(summary.activeRecurring)} />
       </View>
+      <Muted>Balance = donations minus payment-processing fees, minus anything already paid out.</Muted>
+      {report.payouts.length > 0 && (
+        <>
+          <H2>Payouts to you</H2>
+          {report.payouts.map((p) => (
+            <Card key={p.id} style={{ flexDirection: 'row', justifyContent: 'space-between' }}>
+              <View style={{ flex: 1 }}>
+                <Text style={{ fontWeight: '600' }}>{p.method === 'ach_manual' ? 'Bank transfer (ACH)' : 'Stripe transfer'}</Text>
+                <Muted>{new Date(p.createdAt).toLocaleDateString()}{p.status === 'pending' ? ' · pending' : ''}</Muted>
+              </View>
+              <Text style={{ fontWeight: '700', color: colors.primary }}>{cents(p.amountCents)}</Text>
+            </Card>
+          ))}
+        </>
+      )}
       <H2>Recent donations</H2>
       {report.donations.length === 0 && <Muted>No donations yet.</Muted>}
       {report.donations.map((d) => (

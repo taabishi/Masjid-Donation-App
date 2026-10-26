@@ -77,7 +77,7 @@ export default function MosqueDetail() {
               <Chip title="Weekly" selected={freq === 'weekly'} onPress={() => setFreq('weekly')} />
               <Chip title="Monthly" selected={freq === 'monthly'} onPress={() => setFreq('monthly')} />
             </View>
-            <Field label="Amount ($)" keyboardType="decimal-pad" value={amount} onChangeText={setAmount} />
+            <Field label="Amount ($5 minimum)" keyboardType="decimal-pad" value={amount} onChangeText={setAmount} />
             <Button title="Start recurring donation" busy={busy} onPress={startRecurring} />
             {needsMethod && <Button title="Add a payment method first" variant="outline" style={{ marginTop: 8 }} onPress={() => router.push('/(donor)/payment')} />}
             {recMsg && <Text style={{ color: colors.primary, marginTop: 8 }}>{recMsg}</Text>}

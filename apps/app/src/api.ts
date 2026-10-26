@@ -15,7 +15,8 @@ export interface Recurring {
   id: string; mosqueId: string; mosqueName: string; amountCents: number; frequency: 'weekly' | 'monthly'; nextDate: string; causeId?: string;
 }
 export interface AdminReport {
-  summary: { totalCents: number; thisMonthCents: number; donationCount: number; activeRecurring: number };
+  summary: { totalCents: number; thisMonthCents: number; donationCount: number; activeRecurring: number; balanceCents: number };
+  payouts: { id: string; amountCents: number; method: 'stripe_transfer' | 'ach_manual'; status: string; createdAt: string }[];
   donations: { id: string; amountCents: number; createdAt: string; recurring: boolean; donorName: string; cause?: string }[];
 }
 

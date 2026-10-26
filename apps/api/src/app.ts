@@ -6,8 +6,10 @@ import { z } from 'zod';
 import { newId, type Mosque, type Role, type Store, type User } from './store.js';
 import type { PaymentProvider } from './payments.js';
 import { chargeDonation } from './donate.js';
+import { balanceOf, completePayout, createPayout, failPayout, PLATFORM, reconcile, recordDispute, recordRefund, settleDonation } from './ledger.js';
 
-const MIN_CENTS = 100; // $1
+// Card fees are ~2.9% + 30c, so tiny gifts lose a large share to fees. Keep in sync with the app.
+const MIN_CENTS = 500; // $5
 const MAX_CENTS = 1_000_000; // $10,000
 
 interface AuthedRequest extends Request {
@@ -19,32 +21,51 @@ export interface AppOptions {
   apiPublicUrl: string;
   /** URL prefixes the return page may redirect back to (web app origin, native deep-link schemes). */
   allowedReturnPrefixes: string[];
+  /** Emails allowed to use the /ops platform-operator endpoints (balances, payouts, reconciliation). */
+  operatorEmails: string[];
 }
 
-export function createApp(store: Store, payments: PaymentProvider, jwtSecret: string, opts: AppOptions = { apiPublicUrl: 'http://localhost:4000', allowedReturnPrefixes: ['http://localhost:8081', 'masjiddonation://', 'exp://'] }) {
+export function createApp(store: Store, payments: PaymentProvider, jwtSecret: string, opts: AppOptions = { apiPublicUrl: 'http://localhost:4000', allowedReturnPrefixes: ['http://localhost:8081', 'masjiddonation://', 'exp://'], operatorEmails: [] }) {
   const app = express();
   app.use(cors());
 
   // Stripe signs the raw body, so this must be registered before express.json().
-  app.post('/webhooks/payments', express.raw({ type: '*/*' }), (req, res) => {
+  app.post('/webhooks/payments', express.raw({ type: '*/*' }), async (req, res) => {
     let event;
     try {
       event = payments.parseWebhook(req.body as Buffer, req.headers['stripe-signature'] as string | undefined);
     } catch {
       return res.status(400).json({ error: 'Invalid webhook' });
     }
-    if (event.kind === 'payment') {
-      const don = store.data.donations.find((x) => x.paymentRef === event.reference);
-      if (don && don.status !== event.status) {
-        don.status = event.status;
-        store.save();
+    try {
+      const byRef = (ref: string) => store.data.donations.find((x) => x.paymentRef === ref);
+      if (event.kind === 'payment') {
+        const don = byRef(event.reference);
+        if (don && event.status === 'succeeded') {
+          don.status = 'succeeded';
+          store.save();
+          const fee = await payments.getFee(event.reference);
+          if (fee !== null) settleDonation(store, don, fee);
+        } else if (don && don.status === 'processing') {
+          don.status = 'failed';
+          store.save();
+        }
+      } else if (event.kind === 'refund') {
+        const don = byRef(event.reference);
+        if (don) recordRefund(store, don, event.totalRefundedCents);
+      } else if (event.kind === 'dispute') {
+        const don = byRef(event.reference);
+        if (don) recordDispute(store, don, event.disputeId, event.amountCents, event.outcome);
+      } else if (event.kind === 'account') {
+        const m = store.data.mosques.find((x) => x.payoutAccountId === event.accountId);
+        if (m && m.payoutsConnected !== event.ready) {
+          m.payoutsConnected = event.ready;
+          store.save();
+        }
       }
-    } else if (event.kind === 'account') {
-      const m = store.data.mosques.find((x) => x.payoutAccountId === event.accountId);
-      if (m && m.payoutsConnected !== event.ready) {
-        m.payoutsConnected = event.ready;
-        store.save();
-      }
+    } catch (e) {
+      console.error('webhook handling failed', e);
+      return res.status(500).json({ error: 'Failed' }); // Stripe will retry; handlers are idempotent
     }
     res.json({ received: true });
   });
@@ -87,7 +108,7 @@ export function createApp(store: Store, payments: PaymentProvider, jwtSecret: st
     address: m.address,
     description: m.description,
     causes: m.causes,
-    acceptingDonations: m.payoutsConnected,
+    acceptingDonations: true, // the platform collects on every mosque's behalf; payouts are tracked separately
     isFavorite: userId ? d().favorites.some((f) => f.userId === userId && f.mosqueId === m.id) : false,
   });
 
@@ -238,7 +259,6 @@ export function createApp(store: Store, payments: PaymentProvider, jwtSecret: st
   const checkTarget = (mosqueId: string, causeId: string | undefined, res: Response) => {
     const mosque = d().mosques.find((m) => m.id === mosqueId);
     if (!mosque) return void res.status(404).json({ error: 'Mosque not found' });
-    if (!mosque.payoutsConnected) return void res.status(409).json({ error: 'This mosque is not accepting donations yet' });
     if (causeId && !mosque.causes.some((c) => c.id === causeId)) return void res.status(400).json({ error: 'Unknown cause' });
     return mosque;
   };
@@ -404,7 +424,13 @@ export function createApp(store: Store, payments: PaymentProvider, jwtSecret: st
         thisMonthCents: sum(all.filter((x) => x.createdAt >= monthStart)),
         donationCount: all.length,
         activeRecurring: d().recurring.filter((r) => r.mosqueId === m.id && r.active).length,
+        // collected for this mosque and not yet paid out
+        balanceCents: balanceOf(store, m.id),
       },
+      payouts: d()
+        .payouts.filter((x) => x.mosqueId === m.id && x.status !== 'failed')
+        .sort((a, b) => b.createdAt.localeCompare(a.createdAt))
+        .map((x) => ({ id: x.id, amountCents: x.amountCents, method: x.method, status: x.status, createdAt: x.createdAt })),
       // donor names are shown to the mosque admin; email is intentionally not exposed
       donations: all
         .sort((a, b) => b.createdAt.localeCompare(a.createdAt))
@@ -418,6 +444,67 @@ export function createApp(store: Store, payments: PaymentProvider, jwtSecret: st
           cause: m.causes.find((c) => c.id === x.causeId)?.title,
         })),
     });
+  });
+
+  // ---------- platform operator ----------
+  const operator = (req: AuthedRequest, res: Response, next: NextFunction) =>
+    opts.operatorEmails.includes(req.user!.email) ? next() : void res.status(403).json({ error: 'Not allowed' });
+
+  app.get('/ops/balances', auth(), operator, (_req, res) => {
+    const rows = d().mosques.map((m) => ({
+      mosqueId: m.id,
+      name: m.name,
+      owedCents: balanceOf(store, m.id),
+      payoutsConnected: m.payoutsConnected,
+    }));
+    res.json({ mosques: rows, platformCents: balanceOf(store, PLATFORM), totalOwedCents: rows.reduce((s, r) => s + r.owedCents, 0) });
+  });
+
+  app.get('/ops/ledger', auth(), operator, (req, res) => {
+    const account = req.query.account ? String(req.query.account) : undefined;
+    res.json(d().ledger.filter((e) => !account || e.account === account).slice(-200).reverse());
+  });
+
+  app.get('/ops/reconcile', auth(), operator, async (req, res) => {
+    const bankCents = Math.trunc(Number(req.query.bankCents ?? 0)) || 0;
+    res.json(await reconcile(store, payments, bankCents));
+  });
+
+  const payoutSchema = z.object({
+    mosqueId: z.string(),
+    amountCents: z.number().int().positive(),
+    method: z.enum(['stripe_transfer', 'ach_manual']),
+    reference: z.string().trim().optional(), // e.g. the bank's ACH trace number, for ach_manual
+  });
+
+  app.post('/ops/payouts', auth(), operator, async (req, res) => {
+    const body = parse(payoutSchema, req.body, res);
+    if (!body) return;
+    const mosque = d().mosques.find((m) => m.id === body.mosqueId);
+    if (!mosque) return res.status(404).json({ error: 'Mosque not found' });
+    if (body.method === 'stripe_transfer' && !(mosque.payoutsConnected && mosque.payoutAccountId)) {
+      return res.status(409).json({ error: 'This mosque has not finished payout onboarding. Use ach_manual or wait for onboarding.' });
+    }
+    let payout;
+    try {
+      payout = createPayout(store, mosque.id, body.amountCents, body.method);
+    } catch (e) {
+      return res.status(409).json({ error: (e as Error).message });
+    }
+    if (body.method === 'ach_manual') {
+      // the operator sends the ACH from the bank; this records that it happened
+      completePayout(store, payout, body.reference);
+      return res.status(201).json(payout);
+    }
+    try {
+      const t = await payments.transfer({ accountId: mosque.payoutAccountId!, amountCents: payout.amountCents, idempotencyKey: `payout-${payout.id}` });
+      completePayout(store, payout, t.reference);
+      res.status(201).json(payout);
+    } catch (e) {
+      console.error('transfer failed', e);
+      failPayout(store, payout); // credit the mosque's balance back
+      res.status(502).json({ error: 'Transfer failed; the balance was restored.' });
+    }
   });
 
   return app;

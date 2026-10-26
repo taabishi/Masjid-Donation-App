@@ -1,4 +1,5 @@
 import type { PaymentProvider } from './payments.js';
+import { settleDonation } from './ledger.js';
 import { newId, type Donation, type Mosque, type Store, type User } from './store.js';
 
 export type DonateOutcome =
@@ -32,19 +33,21 @@ export async function chargeDonation(
   const method = opts.paymentMethodId ? methods.find((m) => m.id === opts.paymentMethodId) : methods[0];
   if (!method) return noMethod;
 
-  const result = mosque.payoutsConnected
-    ? await payments.charge({
-        amountCents: opts.amountCents,
-        customerId: user.paymentCustomerId,
-        paymentMethodId: method.id,
-        mosque,
-        description: `${opts.recurringId ? 'Recurring donation' : 'Donation'} to ${mosque.name}`,
-        idempotencyKey: opts.idempotencyKey,
-      })
-    : { status: 'failed' as const, error: 'Mosque cannot accept payments' };
+  // every donation gets its id up front so it can be tagged on the charge for reconciliation
+  const id = newId();
+  const result = await payments.charge({
+    donationId: id,
+    methodType: method.type,
+    amountCents: opts.amountCents,
+    customerId: user.paymentCustomerId,
+    paymentMethodId: method.id,
+    mosque,
+    description: `${opts.recurringId ? 'Recurring donation' : 'Donation'} to ${mosque.name}`,
+    idempotencyKey: opts.idempotencyKey,
+  });
 
   const donation: Donation = {
-    id: newId(),
+    id,
     userId: user.id,
     mosqueId: mosque.id,
     causeId: opts.causeId,
@@ -56,6 +59,8 @@ export async function chargeDonation(
   };
   store.data.donations.push(donation);
   store.save();
+  // when the fee isn't known yet (e.g. bank debits) the periodic settleUnsettled sweep records it
+  if (result.status === 'succeeded' && typeof result.feeCents === 'number') settleDonation(store, donation, result.feeCents);
   if (result.status === 'failed') return { ok: false, code: 'payment_failed', error: result.error ?? 'Payment failed', donation };
   return { ok: true, donation };
 }

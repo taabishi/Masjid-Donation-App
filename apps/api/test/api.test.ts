@@ -11,7 +11,11 @@ const RET = { returnUrl: 'http://localhost:8081/payment-methods' };
 async function setup() {
   const store = new Store();
   const payments = new MockPaymentProvider();
-  const server = createApp(store, payments, 'test').listen(0);
+  const server = createApp(store, payments, 'test', {
+    apiPublicUrl: 'http://localhost',
+    allowedReturnPrefixes: ['http://localhost:8081'],
+    operatorEmails: ['ops@example.com'],
+  }).listen(0);
   const base = `http://localhost:${(server.address() as AddressInfo).port}`;
   const call = async (method: string, path: string, body?: unknown, token?: string) => {
     const res = await fetch(base + path, {
@@ -46,7 +50,7 @@ test('donor flow: favorite, donate, recurring, history', async () => {
   assert.equal((await call('GET', '/favorites', undefined, t)).body[0].isFavorite, true);
 
   assert.equal((await call('POST', '/donations', { mosqueId: m.id, amountCents: 500 }, t)).status, 201);
-  assert.equal((await call('POST', '/donations', { mosqueId: m.id, amountCents: 5 }, t)).status, 400);
+  assert.equal((await call('POST', '/donations', { mosqueId: m.id, amountCents: 499 }, t)).status, 400);
   assert.equal((await call('POST', '/donations', { mosqueId: m.id, amountCents: 500, causeId: 'nope' }, t)).status, 400);
 
   const rec = await call('POST', '/recurring', { mosqueId: m.id, amountCents: 1500, frequency: 'weekly' }, t);
@@ -63,7 +67,7 @@ test('donor flow: favorite, donate, recurring, history', async () => {
   close();
 });
 
-test('admin flow: mosque must connect payouts before accepting donations', async () => {
+test('platform collects for a mosque before it onboards; operator pays out from the ledger', async () => {
   const { call, close } = await setup();
   const admin = await call('POST', '/auth/register', {
     name: 'Imam', email: 'imam@example.com', password: 'password1',
@@ -71,19 +75,56 @@ test('admin flow: mosque must connect payouts before accepting donations', async
   });
   const at = admin.body.token;
   const donor = (await call('POST', '/auth/register', { name: 'Sara', email: 'sara@example.com', password: 'password1' })).body.token;
+  const ops = (await call('POST', '/auth/register', { name: 'Ops', email: 'ops@example.com', password: 'password1' })).body.token;
   await call('POST', '/payment-methods', RET, donor);
 
   const mosque = (await call('GET', '/admin/mosque', undefined, at)).body;
-  assert.equal((await call('POST', '/donations', { mosqueId: mosque.id, amountCents: 500 }, donor)).status, 409);
-
-  assert.equal((await call('POST', '/admin/payouts/connect', RET, at)).status, 200);
+  assert.equal(mosque.payoutsConnected, false);
   const cause = (await call('POST', '/admin/causes', { title: 'Roof Repair', description: 'Fix the roof' }, at)).body;
+  // donations work even though the mosque has not connected payouts
   assert.equal((await call('POST', '/donations', { mosqueId: mosque.id, amountCents: 2500, causeId: cause.id }, donor)).status, 201);
 
   const report = (await call('GET', '/admin/donations', undefined, at)).body;
   assert.equal(report.summary.totalCents, 2500);
+  assert.equal(report.summary.balanceCents, 2397); // 2500 minus mock card fee (2.9% + 30c)
   assert.equal(report.donations[0].donorName, 'Sara');
   assert.equal(report.donations[0].cause, 'Roof Repair');
+
+  // only operators can see balances or pay out
+  assert.equal((await call('GET', '/ops/balances', undefined, donor)).status, 403);
+  assert.equal((await call('POST', '/ops/payouts', { mosqueId: mosque.id, amountCents: 100, method: 'ach_manual' }, at)).status, 403);
+
+  const bal = (await call('GET', '/ops/balances', undefined, ops)).body;
+  assert.equal(bal.mosques.find((x: { mosqueId: string }) => x.mosqueId === mosque.id).owedCents, 2397);
+
+  // manual ACH works before onboarding; Stripe transfer does not
+  assert.equal((await call('POST', '/ops/payouts', { mosqueId: mosque.id, amountCents: 1000, method: 'ach_manual', reference: 'TRACE123' }, ops)).status, 201);
+  assert.equal((await call('POST', '/ops/payouts', { mosqueId: mosque.id, amountCents: 100, method: 'stripe_transfer' }, ops)).status, 409);
+  // cannot pay out more than is owed
+  assert.equal((await call('POST', '/ops/payouts', { mosqueId: mosque.id, amountCents: 1398, method: 'ach_manual' }, ops)).status, 409);
+
+  assert.equal((await call('POST', '/admin/payouts/connect', RET, at)).status, 200);
+  assert.equal((await call('POST', '/ops/payouts', { mosqueId: mosque.id, amountCents: 1397, method: 'stripe_transfer' }, ops)).status, 201);
+  const after = (await call('GET', '/admin/donations', undefined, at)).body;
+  assert.equal(after.summary.balanceCents, 0);
+  assert.equal(after.payouts.length, 2);
+  close();
+});
+
+test('reconciliation matches the provider balance', async () => {
+  const { call, close } = await setup();
+  const m = (await call('POST', '/auth/register', { name: 'I', email: 'i@example.com', password: 'password1', mosque: { name: 'M', city: 'C', state: 'S' } })).body;
+  const ops = (await call('POST', '/auth/register', { name: 'Ops', email: 'ops@example.com', password: 'password1' })).body.token;
+  const donor = (await call('POST', '/auth/register', { name: 'D', email: 'd@example.com', password: 'password1' })).body.token;
+  await call('POST', '/payment-methods', RET, donor);
+  const mosqueId = m.user.mosqueId;
+  await call('POST', '/donations', { mosqueId, amountCents: 700 }, donor);
+  await call('POST', '/donations', { mosqueId, amountCents: 1200 }, donor);
+  await call('POST', '/admin/payouts/connect', RET, m.token);
+  await call('POST', '/ops/payouts', { mosqueId, amountCents: 500, method: 'stripe_transfer' }, ops);
+  const rec = (await call('GET', '/ops/reconcile', undefined, ops)).body;
+  assert.equal(rec.diffCents, 0);
+  assert.equal(rec.unsettledDonations, 0);
   close();
 });
 

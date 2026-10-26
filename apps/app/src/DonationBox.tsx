@@ -5,7 +5,9 @@ import { api, ApiError, type Mosque } from './api';
 import { cents, colors } from './theme';
 import { Button, Chip, ErrorText, Field, Muted } from './ui';
 
-const QUICK = [100, 500, 1500, 2500];
+// Card fees (~2.9% + 30c) make smaller gifts uneconomical. Keep in sync with the API.
+const MIN_CENTS = 500;
+const QUICK = [500, 1000, 1500, 2500];
 
 /** The "digital donation box": quick amounts, custom amount, optional cause, with an inline confirm step. */
 export function DonationBox({ mosque, showCauses = false, onDonated }: { mosque: Mosque; showCauses?: boolean; onDonated?: () => void }) {
@@ -57,12 +59,12 @@ export function DonationBox({ mosque, showCauses = false, onDonated }: { mosque:
       {custom !== null && (
         <View style={{ flexDirection: 'row', alignItems: 'flex-end', gap: 8 }}>
           <View style={{ flex: 1 }}>
-            <Field label="Amount ($)" keyboardType="decimal-pad" value={custom} onChangeText={(t) => { setCustom(t); setPending(null); }} placeholder="10.00" />
+            <Field label="Amount ($5 minimum)" keyboardType="decimal-pad" value={custom} onChangeText={(t) => { setCustom(t); setPending(null); }} placeholder="10.00" />
           </View>
           <Button
             title="Next"
             style={{ marginBottom: 12 }}
-            disabled={!(customCents >= 100 && customCents <= 1_000_000)}
+            disabled={!(customCents >= MIN_CENTS && customCents <= 1_000_000)}
             onPress={() => pick(customCents)}
           />
         </View>

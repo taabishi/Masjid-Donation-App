@@ -5,6 +5,7 @@ import bcrypt from 'bcryptjs';
 import { z } from 'zod';
 import { newId, type Mosque, type Role, type Store, type User } from './store.js';
 import type { PaymentProvider } from './payments.js';
+import { chargeDonation } from './donate.js';
 
 const MIN_CENTS = 100; // $1
 const MAX_CENTS = 1_000_000; // $10,000
@@ -13,9 +14,41 @@ interface AuthedRequest extends Request {
   user?: User;
 }
 
-export function createApp(store: Store, payments: PaymentProvider, jwtSecret: string) {
+export interface AppOptions {
+  /** Public base URL of this API, used for hosted-page return links. */
+  apiPublicUrl: string;
+  /** URL prefixes the return page may redirect back to (web app origin, native deep-link schemes). */
+  allowedReturnPrefixes: string[];
+}
+
+export function createApp(store: Store, payments: PaymentProvider, jwtSecret: string, opts: AppOptions = { apiPublicUrl: 'http://localhost:4000', allowedReturnPrefixes: ['http://localhost:8081', 'masjiddonation://', 'exp://'] }) {
   const app = express();
   app.use(cors());
+
+  // Stripe signs the raw body, so this must be registered before express.json().
+  app.post('/webhooks/payments', express.raw({ type: '*/*' }), (req, res) => {
+    let event;
+    try {
+      event = payments.parseWebhook(req.body as Buffer, req.headers['stripe-signature'] as string | undefined);
+    } catch {
+      return res.status(400).json({ error: 'Invalid webhook' });
+    }
+    if (event.kind === 'payment') {
+      const don = store.data.donations.find((x) => x.paymentRef === event.reference);
+      if (don && don.status !== event.status) {
+        don.status = event.status;
+        store.save();
+      }
+    } else if (event.kind === 'account') {
+      const m = store.data.mosques.find((x) => x.payoutAccountId === event.accountId);
+      if (m && m.payoutsConnected !== event.ready) {
+        m.payoutsConnected = event.ready;
+        store.save();
+      }
+    }
+    res.json({ received: true });
+  });
+
   app.use(express.json());
 
   const d = () => store.data;
@@ -146,9 +179,61 @@ export function createApp(store: Store, payments: PaymentProvider, jwtSecret: st
     res.status(204).end();
   });
 
+  // ---------- hosted-page return ----------
+  const allowedReturn = (url: unknown): url is string =>
+    typeof url === 'string' && opts.allowedReturnPrefixes.some((p) => url.startsWith(p));
+
+  /** Stripe's hosted pages redirect here; we bounce the user back into the app (web URL or deep link). */
+  app.get('/payment-return', (req, res) => {
+    const to = req.query.to;
+    if (!allowedReturn(to)) return res.status(400).send('Invalid return address');
+    const safe = to.replace(/"/g, '%22');
+    res
+      .type('html')
+      .send(`<!doctype html><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><meta http-equiv="refresh" content="0;url=${safe}"><title>Returning…</title><body style="font-family:sans-serif;text-align:center;padding:48px"><p>All set.</p><p><a href="${safe}">Return to Masjid Donation Box</a></p>`);
+  });
+
+  const returnLink = (to: string) => `${opts.apiPublicUrl}/payment-return?to=${encodeURIComponent(to)}`;
+  const returnSchema = z.object({ returnUrl: z.string() }).refine((b) => allowedReturn(b.returnUrl), { message: 'returnUrl not allowed', path: ['returnUrl'] });
+
+  const customerFor = async (user: User) => {
+    if (!user.paymentCustomerId) {
+      user.paymentCustomerId = await payments.createCustomer(user);
+      store.save();
+    }
+    return user.paymentCustomerId;
+  };
+
+  // ---------- payment methods (donor) ----------
+  app.get('/payment-methods', auth(), async (req: AuthedRequest, res) => {
+    const id = req.user!.paymentCustomerId;
+    res.json(id ? await payments.listMethods(id) : []);
+  });
+
+  // Returns { url } to open (Stripe-hosted page for cards / Apple Pay / Google Pay / bank accounts), or { url: null } if nothing to open.
+  app.post('/payment-methods', auth(), async (req: AuthedRequest, res) => {
+    const body = parse(returnSchema, req.body, res);
+    if (!body) return;
+    res.json(await payments.beginAddPaymentMethod(await customerFor(req.user!), returnLink(body.returnUrl)));
+  });
+
+  app.delete('/payment-methods/:id', auth(), async (req: AuthedRequest, res) => {
+    const customerId = req.user!.paymentCustomerId;
+    if (!customerId) return res.status(404).json({ error: 'Not found' });
+    try {
+      await payments.removeMethod(customerId, String(req.params.id));
+    } catch {
+      return res.status(404).json({ error: 'Not found' });
+    }
+    // schedules that used this method fall back to the donor's next saved method
+    for (const r of d().recurring) if (r.userId === req.user!.id && r.paymentMethodId === req.params.id) r.paymentMethodId = undefined;
+    store.save();
+    res.status(204).end();
+  });
+
   // ---------- donations ----------
   const amountSchema = z.number().int().min(MIN_CENTS).max(MAX_CENTS);
-  const donationSchema = z.object({ mosqueId: z.string(), amountCents: amountSchema, causeId: z.string().optional() });
+  const donationSchema = z.object({ mosqueId: z.string(), amountCents: amountSchema, causeId: z.string().optional(), paymentMethodId: z.string().optional() });
 
   const checkTarget = (mosqueId: string, causeId: string | undefined, res: Response) => {
     const mosque = d().mosques.find((m) => m.id === mosqueId);
@@ -163,21 +248,15 @@ export function createApp(store: Store, payments: PaymentProvider, jwtSecret: st
     if (!body) return;
     const mosque = checkTarget(body.mosqueId, body.causeId, res);
     if (!mosque) return;
-    const result = await payments.charge({ amountCents: body.amountCents, donor: req.user!, mosque, description: `Donation to ${mosque.name}` });
-    const donation = {
-      id: newId(),
-      userId: req.user!.id,
-      mosqueId: mosque.id,
-      causeId: body.causeId,
-      amountCents: body.amountCents,
-      status: result.ok ? ('succeeded' as const) : ('failed' as const),
-      paymentRef: result.reference,
-      createdAt: new Date().toISOString(),
-    };
-    d().donations.push(donation);
-    store.save();
-    if (!result.ok) return res.status(402).json({ error: result.error ?? 'Payment failed' });
-    res.status(201).json(donation);
+    try {
+      // a fresh key per request: donors may legitimately give the same amount twice
+      const out = await chargeDonation(store, payments, { user: req.user!, mosque, ...body, idempotencyKey: `don-${newId()}` });
+      if (!out.ok) return res.status(out.code === 'no_payment_method' ? 409 : 402).json({ error: out.error, code: out.code });
+      res.status(201).json(out.donation);
+    } catch (e) {
+      console.error('payment provider error', e);
+      res.status(502).json({ error: 'Payment service is unavailable. You were not charged.' });
+    }
   });
 
   app.get('/donations', auth(), (req: AuthedRequest, res) => {
@@ -194,6 +273,7 @@ export function createApp(store: Store, payments: PaymentProvider, jwtSecret: st
     amountCents: amountSchema,
     frequency: z.enum(['weekly', 'monthly']),
     causeId: z.string().optional(),
+    paymentMethodId: z.string().optional(),
   });
 
   const recurringView = (r: ReturnType<typeof d>['recurring'][number]) => ({
@@ -201,10 +281,15 @@ export function createApp(store: Store, payments: PaymentProvider, jwtSecret: st
     mosqueName: d().mosques.find((m) => m.id === r.mosqueId)?.name ?? 'Unknown',
   });
 
-  app.post('/recurring', auth(), (req: AuthedRequest, res) => {
+  app.post('/recurring', auth(), async (req: AuthedRequest, res) => {
     const body = parse(recurringSchema, req.body, res);
     if (!body) return;
     if (!checkTarget(body.mosqueId, body.causeId, res)) return;
+    const customerId = req.user!.paymentCustomerId;
+    const methods = customerId ? await payments.listMethods(customerId) : [];
+    if (!methods.length || (body.paymentMethodId && !methods.some((m) => m.id === body.paymentMethodId))) {
+      return res.status(409).json({ error: 'Add a payment method first', code: 'no_payment_method' });
+    }
     const now = new Date();
     // first charge is one period from now; donors can give right away with a one-time donation
     const r = {
@@ -235,8 +320,17 @@ export function createApp(store: Store, payments: PaymentProvider, jwtSecret: st
   // ---------- admin (mosque) ----------
   const adminMosque = (req: AuthedRequest) => d().mosques.find((m) => m.id === req.user!.mosqueId)!;
 
-  app.get('/admin/mosque', auth('admin'), (req: AuthedRequest, res) => {
+  app.get('/admin/mosque', auth('admin'), async (req: AuthedRequest, res) => {
     const m = adminMosque(req);
+    // pick up onboarding finished on the provider's hosted page (webhooks may lag or be unconfigured)
+    if (!m.payoutsConnected && m.payoutAccountId) {
+      try {
+        m.payoutsConnected = await payments.isMosqueReady(m.payoutAccountId);
+        store.save();
+      } catch (e) {
+        console.error('payout status check failed', e);
+      }
+    }
     res.json({ ...mosqueView(m), payoutsConnected: m.payoutsConnected });
   });
 
@@ -258,12 +352,16 @@ export function createApp(store: Store, payments: PaymentProvider, jwtSecret: st
     res.json(mosqueView(adminMosque(req)));
   });
 
+  // Returns { url } for the provider's hosted onboarding page, or { url: null, payoutsConnected: true } when no onboarding is needed.
   app.post('/admin/payouts/connect', auth('admin'), async (req: AuthedRequest, res) => {
+    const body = parse(returnSchema, req.body, res);
+    if (!body) return;
     const m = adminMosque(req);
-    m.payoutAccountId = await payments.connectMosque(m);
-    m.payoutsConnected = true;
+    const step = await payments.beginMosqueOnboarding(m, returnLink(body.returnUrl));
+    m.payoutAccountId = step.accountId;
+    if (!step.url) m.payoutsConnected = await payments.isMosqueReady(step.accountId);
     store.save();
-    res.json({ payoutsConnected: true });
+    res.json({ url: step.url, payoutsConnected: m.payoutsConnected });
   });
 
   const causeSchema = z.object({ title: z.string().trim().min(1), description: z.string().trim().default('') });

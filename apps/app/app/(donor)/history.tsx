@@ -34,8 +34,8 @@ export default function History() {
             <Text style={{ fontWeight: '600' }}>{d.mosqueName}</Text>
             <Muted>{new Date(d.createdAt).toLocaleDateString()}{d.recurringId ? ' · recurring' : ''}</Muted>
           </View>
-          <Text style={{ fontWeight: '700', color: d.status === 'succeeded' ? colors.primary : colors.danger }}>
-            {cents(d.amountCents)}{d.status === 'failed' ? ' (failed)' : ''}
+          <Text style={{ fontWeight: '700', color: d.status === 'failed' ? colors.danger : d.status === 'processing' ? colors.muted : colors.primary }}>
+            {cents(d.amountCents)}{d.status === 'failed' ? ' (failed)' : d.status === 'processing' ? ' (pending)' : ''}
           </Text>
         </Card>
       ))}

@@ -1,6 +1,7 @@
 import React, { useState } from 'react';
 import { Text, View } from 'react-native';
-import { api, type Mosque } from './api';
+import { useRouter } from 'expo-router';
+import { api, ApiError, type Mosque } from './api';
 import { cents, colors } from './theme';
 import { Button, Chip, ErrorText, Field, Muted } from './ui';
 
@@ -14,10 +15,12 @@ export function DonationBox({ mosque, showCauses = false, onDonated }: { mosque:
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [thanks, setThanks] = useState<number | null>(null);
+  const [needsMethod, setNeedsMethod] = useState(false);
+  const router = useRouter();
 
   if (!mosque.acceptingDonations) return <Muted>This mosque hasn't finished setting up donations yet.</Muted>;
 
-  const pick = (amount: number) => { setPending(amount); setThanks(null); setError(null); };
+  const pick = (amount: number) => { setPending(amount); setThanks(null); setError(null); setNeedsMethod(false); };
 
   const confirm = async () => {
     if (!pending) return;
@@ -30,7 +33,8 @@ export function DonationBox({ mosque, showCauses = false, onDonated }: { mosque:
       setCustom(null);
       onDonated?.();
     } catch (e) {
-      setError((e as Error).message);
+      if (e instanceof ApiError && e.code === 'no_payment_method') setNeedsMethod(true);
+      else setError((e as Error).message);
     } finally {
       setBusy(false);
     }
@@ -73,6 +77,12 @@ export function DonationBox({ mosque, showCauses = false, onDonated }: { mosque:
         </View>
       )}
       {thanks && <Text style={{ color: colors.primary, fontWeight: '600', marginTop: 8 }}>JazakAllahu khayran — {cents(thanks)} donated.</Text>}
+      {needsMethod && (
+        <View style={{ marginTop: 8 }}>
+          <Text style={{ color: colors.danger, marginBottom: 8 }}>Add a card, Apple Pay or bank account to start giving.</Text>
+          <Button title="Add payment method" variant="outline" onPress={() => router.push('/(donor)/payment')} />
+        </View>
+      )}
       <ErrorText>{error}</ErrorText>
     </View>
   );

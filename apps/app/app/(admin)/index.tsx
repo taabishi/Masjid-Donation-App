@@ -3,6 +3,7 @@ import { useCallback, useState } from 'react';
 import { Text, View } from 'react-native';
 import { api, type AdminReport, type Mosque } from '../../src/api';
 import { useAuth } from '../../src/auth';
+import { openHosted, returnUrl } from '../../src/hosted';
 import { cents, colors } from '../../src/theme';
 import { Button, Card, ErrorText, H1, H2, Loading, Muted, Screen } from '../../src/ui';
 
@@ -30,7 +31,8 @@ export default function Dashboard() {
   const connect = async () => {
     setBusy(true);
     try {
-      await api('POST', '/admin/payouts/connect');
+      const r = await api<{ url: string | null }>('POST', '/admin/payouts/connect', { returnUrl: returnUrl('/') });
+      if (r.url) await openHosted(r.url);
       load();
     } catch (e) {
       setError((e as Error).message);
@@ -49,7 +51,7 @@ export default function Dashboard() {
       {!mosque.payoutsConnected ? (
         <Card style={{ borderColor: colors.gold }}>
           <Text style={{ fontWeight: '700' }}>Set up payouts to start receiving donations</Text>
-          <Muted style={{ marginVertical: 8 }}>Donors can't give until your bank account is connected. (Demo mode: this connects a mock account.)</Muted>
+          <Muted style={{ marginVertical: 8 }}>Donors can't give until your organization is verified and your bank account is connected. You'll finish this on Stripe's secure page.</Muted>
           <Button title="Connect payout account" busy={busy} onPress={connect} />
         </Card>
       ) : (

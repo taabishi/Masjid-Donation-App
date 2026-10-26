@@ -6,6 +6,8 @@ import { MockPaymentProvider } from '../src/payments.js';
 import { addPeriod, processDueRecurring } from '../src/recurring.js';
 import { Store } from '../src/store.js';
 
+const RET = { returnUrl: 'http://localhost:8081/payment-methods' };
+
 async function setup() {
   const store = new Store();
   const payments = new MockPaymentProvider();
@@ -32,6 +34,13 @@ test('donor flow: favorite, donate, recurring, history', async () => {
   const mosques = (await call('GET', '/mosques?q=noor', undefined, t)).body;
   assert.equal(mosques.length, 1);
   const m = mosques[0];
+
+  // no saved payment method yet
+  const noPm = await call('POST', '/donations', { mosqueId: m.id, amountCents: 500 }, t);
+  assert.equal(noPm.status, 409);
+  assert.equal(noPm.body.code, 'no_payment_method');
+  assert.equal((await call('POST', '/payment-methods', RET, t)).status, 200);
+  assert.equal((await call('GET', '/payment-methods', undefined, t)).body.length, 1);
 
   assert.equal((await call('PUT', `/favorites/${m.id}`, undefined, t)).status, 204);
   assert.equal((await call('GET', '/favorites', undefined, t)).body[0].isFavorite, true);
@@ -62,11 +71,12 @@ test('admin flow: mosque must connect payouts before accepting donations', async
   });
   const at = admin.body.token;
   const donor = (await call('POST', '/auth/register', { name: 'Sara', email: 'sara@example.com', password: 'password1' })).body.token;
+  await call('POST', '/payment-methods', RET, donor);
 
   const mosque = (await call('GET', '/admin/mosque', undefined, at)).body;
   assert.equal((await call('POST', '/donations', { mosqueId: mosque.id, amountCents: 500 }, donor)).status, 409);
 
-  assert.equal((await call('POST', '/admin/payouts/connect', undefined, at)).status, 200);
+  assert.equal((await call('POST', '/admin/payouts/connect', RET, at)).status, 200);
   const cause = (await call('POST', '/admin/causes', { title: 'Roof Repair', description: 'Fix the roof' }, at)).body;
   assert.equal((await call('POST', '/donations', { mosqueId: mosque.id, amountCents: 2500, causeId: cause.id }, donor)).status, 201);
 
@@ -83,6 +93,13 @@ test('authorization boundaries', async () => {
   const donor = (await call('POST', '/auth/register', { name: 'A', email: 'a@example.com', password: 'password1' })).body.token;
   assert.equal((await call('GET', '/admin/mosque', undefined, donor)).status, 403);
   assert.equal((await call('POST', '/auth/login', { email: 'a@example.com', password: 'wrong' })).status, 401);
+  close();
+});
+
+test('return page only redirects to allowed addresses', async () => {
+  const { call, close } = await setup();
+  const t = (await call('POST', '/auth/register', { name: 'A', email: 'a@example.com', password: 'password1' })).body.token;
+  assert.equal((await call('POST', '/payment-methods', { returnUrl: 'https://evil.example/x' }, t)).status, 400);
   close();
 });
 

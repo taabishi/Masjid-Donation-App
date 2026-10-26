@@ -1,7 +1,7 @@
-import { Stack, useLocalSearchParams } from 'expo-router';
+import { Stack, useLocalSearchParams, useRouter } from 'expo-router';
 import { useEffect, useState } from 'react';
 import { Pressable, Text, View } from 'react-native';
-import { api, type Mosque } from '../../src/api';
+import { api, ApiError, type Mosque } from '../../src/api';
 import { DonationBox } from '../../src/DonationBox';
 import { cents, colors } from '../../src/theme';
 import { Button, Card, Chip, ErrorText, Field, H1, H2, Loading, Muted, Screen } from '../../src/ui';
@@ -14,6 +14,8 @@ export default function MosqueDetail() {
   const [freq, setFreq] = useState<'weekly' | 'monthly'>('weekly');
   const [recMsg, setRecMsg] = useState<string | null>(null);
   const [busy, setBusy] = useState(false);
+  const [needsMethod, setNeedsMethod] = useState(false);
+  const router = useRouter();
 
   useEffect(() => {
     api<Mosque>('GET', `/mosques/${id}`).then(setM).catch((e) => setError(e.message));
@@ -34,12 +36,14 @@ export default function MosqueDetail() {
     setBusy(true);
     setError(null);
     setRecMsg(null);
+    setNeedsMethod(false);
     try {
       const amountCents = Math.round(parseFloat(amount) * 100);
       await api('POST', '/recurring', { mosqueId: m.id, amountCents, frequency: freq });
       setRecMsg(`Done — ${cents(amountCents)} ${freq}. Manage it in the Recurring tab.`);
     } catch (e) {
-      setError((e as Error).message);
+      if (e instanceof ApiError && e.code === 'no_payment_method') setNeedsMethod(true);
+      else setError((e as Error).message);
     } finally {
       setBusy(false);
     }
@@ -75,6 +79,7 @@ export default function MosqueDetail() {
             </View>
             <Field label="Amount ($)" keyboardType="decimal-pad" value={amount} onChangeText={setAmount} />
             <Button title="Start recurring donation" busy={busy} onPress={startRecurring} />
+            {needsMethod && <Button title="Add a payment method first" variant="outline" style={{ marginTop: 8 }} onPress={() => router.push('/(donor)/payment')} />}
             {recMsg && <Text style={{ color: colors.primary, marginTop: 8 }}>{recMsg}</Text>}
           </Card>
         </>

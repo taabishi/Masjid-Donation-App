@@ -12,6 +12,7 @@ export interface User {
   passwordHash: string;
   role: Role;
   mosqueId?: string; // set for admins
+  paymentCustomerId?: string; // provider customer id, created on first use
 }
 
 export interface Cause {
@@ -38,7 +39,7 @@ export interface Donation {
   mosqueId: string;
   causeId?: string;
   amountCents: number;
-  status: 'succeeded' | 'failed';
+  status: 'succeeded' | 'processing' | 'failed';
   recurringId?: string;
   paymentRef?: string;
   createdAt: string;
@@ -51,6 +52,7 @@ export interface Recurring {
   causeId?: string;
   amountCents: number;
   frequency: Frequency;
+  paymentMethodId?: string;
   nextDate: string;
   active: boolean;
   createdAt: string;
@@ -108,11 +110,11 @@ export function seedData(): Data {
 /** Tiny JSON-file backed store; swap for a real database before production. */
 export class Store {
   data: Data;
-  constructor(private file?: string) {
+  constructor(private file?: string, seed = true) {
     if (file && fs.existsSync(file)) {
       this.data = JSON.parse(fs.readFileSync(file, 'utf8'));
     } else {
-      this.data = seedData();
+      this.data = seed ? seedData() : { users: [], mosques: [], favorites: [], donations: [], recurring: [] };
       this.save();
     }
   }

@@ -7,6 +7,7 @@ export interface Mosque {
   causes: Cause[]; acceptingDonations: boolean; isFavorite: boolean;
 }
 export interface User { id: string; name: string; email: string; role: 'donor' | 'admin'; mosqueId?: string }
+export interface PaymentMethod { id: string; type: 'card' | 'us_bank_account'; label: string }
 export interface Donation {
   id: string; mosqueId: string; mosqueName: string; amountCents: number; status: string; recurringId?: string; createdAt: string;
 }
@@ -23,6 +24,10 @@ let onUnauthorized: () => void = () => {};
 export const setToken = (t: string | null) => { token = t; };
 export const setOnUnauthorized = (fn: () => void) => { onUnauthorized = fn; };
 
+export class ApiError extends Error {
+  constructor(message: string, public code?: string) { super(message); }
+}
+
 export async function api<T = void>(method: string, path: string, body?: unknown): Promise<T> {
   let res: Response;
   try {
@@ -37,6 +42,6 @@ export async function api<T = void>(method: string, path: string, body?: unknown
   if (res.status === 401 && token) onUnauthorized();
   const text = await res.text();
   const data = text ? JSON.parse(text) : undefined;
-  if (!res.ok) throw new Error(data?.error ?? `Request failed (${res.status})`);
+  if (!res.ok) throw new ApiError(data?.error ?? `Request failed (${res.status})`, data?.code);
   return data as T;
 }

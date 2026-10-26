@@ -1,5 +1,5 @@
 import type { Frequency, Store } from './store.js';
-import { newId } from './store.js';
+import { chargeDonation } from './donate.js';
 import type { PaymentProvider } from './payments.js';
 
 export function addPeriod(iso: string, freq: Frequency): string {
@@ -18,30 +18,31 @@ export function addPeriod(iso: string, freq: Frequency): string {
 /** Charge every active schedule that is due. Safe to call repeatedly. */
 export async function processDueRecurring(store: Store, payments: PaymentProvider, now = new Date()) {
   let processed = 0;
-  for (const r of store.data.recurring) {
-    if (!r.active) continue;
-    // catch up at most one charge per run so a long outage doesn't double-bill
-    if (new Date(r.nextDate) > now) continue;
-    const donor = store.data.users.find((u) => u.id === r.userId);
+  for (const r of [...store.data.recurring]) {
+    if (!r.active || new Date(r.nextDate) > now) continue;
+    const user = store.data.users.find((u) => u.id === r.userId);
     const mosque = store.data.mosques.find((m) => m.id === r.mosqueId);
-    if (!donor || !mosque) {
+    if (!user || !mosque) {
       r.active = false;
       continue;
     }
-    const result = mosque.payoutsConnected
-      ? await payments.charge({ amountCents: r.amountCents, donor, mosque, description: `Recurring donation to ${mosque.name}` })
-      : { ok: false as const, error: 'Mosque cannot accept payments' };
-    store.data.donations.push({
-      id: newId(),
-      userId: r.userId,
-      mosqueId: r.mosqueId,
-      causeId: r.causeId,
-      amountCents: r.amountCents,
-      status: result.ok ? 'succeeded' : 'failed',
-      recurringId: r.id,
-      paymentRef: result.reference,
-      createdAt: now.toISOString(),
-    });
+    try {
+      // the key is stable per schedule + due date, so retrying after an outage can't double-charge
+      await chargeDonation(store, payments, {
+        user,
+        mosque,
+        amountCents: r.amountCents,
+        causeId: r.causeId,
+        paymentMethodId: r.paymentMethodId,
+        recurringId: r.id,
+        idempotencyKey: `rec-${r.id}-${r.nextDate}`,
+        now,
+      });
+    } catch (e) {
+      console.error(`recurring ${r.id}: provider unavailable, will retry`, e);
+      continue; // leave nextDate alone
+    }
+    // charge at most once per run; skip any periods missed during downtime
     let next = addPeriod(r.nextDate, r.frequency);
     while (new Date(next) <= now) next = addPeriod(next, r.frequency);
     r.nextDate = next;

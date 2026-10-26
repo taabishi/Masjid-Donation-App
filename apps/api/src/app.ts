@@ -3,10 +3,11 @@ import cors from 'cors';
 import jwt from 'jsonwebtoken';
 import bcrypt from 'bcryptjs';
 import { z } from 'zod';
-import { newId, type Mosque, type Role, type Store, type User } from './store.js';
+import { newId, type Mosque, type Role, type User } from './types.js';
 import type { PaymentProvider } from './payments.js';
 import { chargeDonation } from './donate.js';
-import { balanceOf, completePayout, createPayout, failPayout, PLATFORM, reconcile, recordDispute, recordRefund, settleDonation } from './ledger.js';
+import { completePayout, createPayout, failPayout, PayoutError, PLATFORM, reconcile, recordDispute, recordRefund, settleDonation } from './ledger.js';
+import { isUniqueViolation, type MosqueWithFavorite, type Repo } from './repo.js';
 
 // Card fees are ~2.9% + 30c, so tiny gifts lose a large share to fees. Keep in sync with the app.
 const MIN_CENTS = 500; // $5
@@ -25,7 +26,12 @@ export interface AppOptions {
   operatorEmails: string[];
 }
 
-export function createApp(store: Store, payments: PaymentProvider, jwtSecret: string, opts: AppOptions = { apiPublicUrl: 'http://localhost:4000', allowedReturnPrefixes: ['http://localhost:8081', 'masjiddonation://', 'exp://'], operatorEmails: [] }) {
+export function createApp(
+  repo: Repo,
+  payments: PaymentProvider,
+  jwtSecret: string,
+  opts: AppOptions = { apiPublicUrl: 'http://localhost:4000', allowedReturnPrefixes: ['http://localhost:8081', 'masjiddonation://', 'exp://'], operatorEmails: [] },
+) {
   const app = express();
   app.use(cors());
 
@@ -38,30 +44,24 @@ export function createApp(store: Store, payments: PaymentProvider, jwtSecret: st
       return res.status(400).json({ error: 'Invalid webhook' });
     }
     try {
-      const byRef = (ref: string) => store.data.donations.find((x) => x.paymentRef === ref);
       if (event.kind === 'payment') {
-        const don = byRef(event.reference);
+        const don = await repo.donationByRef(event.reference);
         if (don && event.status === 'succeeded') {
-          don.status = 'succeeded';
-          store.save();
+          if (don.status !== 'succeeded') await repo.setDonationStatus(don.id, 'succeeded');
           const fee = await payments.getFee(event.reference);
-          if (fee !== null) settleDonation(store, don, fee);
+          if (fee !== null) await settleDonation(repo, { ...don, status: 'succeeded' }, fee);
         } else if (don && don.status === 'processing') {
-          don.status = 'failed';
-          store.save();
+          await repo.setDonationStatus(don.id, 'failed');
         }
       } else if (event.kind === 'refund') {
-        const don = byRef(event.reference);
-        if (don) recordRefund(store, don, event.totalRefundedCents);
+        const don = await repo.donationByRef(event.reference);
+        if (don) await recordRefund(repo, don, event.totalRefundedCents);
       } else if (event.kind === 'dispute') {
-        const don = byRef(event.reference);
-        if (don) recordDispute(store, don, event.disputeId, event.amountCents, event.outcome);
+        const don = await repo.donationByRef(event.reference);
+        if (don) await recordDispute(repo, don, event.disputeId, event.amountCents, event.outcome);
       } else if (event.kind === 'account') {
-        const m = store.data.mosques.find((x) => x.payoutAccountId === event.accountId);
-        if (m && m.payoutsConnected !== event.ready) {
-          m.payoutsConnected = event.ready;
-          store.save();
-        }
+        const m = await repo.findMosqueByPayoutAccount(event.accountId);
+        if (m && m.payoutsConnected !== event.ready) await repo.setMosquePayout(m.id, undefined, event.ready);
       }
     } catch (e) {
       console.error('webhook handling failed', e);
@@ -72,23 +72,23 @@ export function createApp(store: Store, payments: PaymentProvider, jwtSecret: st
 
   app.use(express.json());
 
-  const d = () => store.data;
   const publicUser = (u: User) => ({ id: u.id, name: u.name, email: u.email, role: u.role, mosqueId: u.mosqueId });
   const sign = (u: User) => jwt.sign({ sub: u.id }, jwtSecret, { expiresIn: '30d' });
 
-  const auth = (role?: Role) => (req: AuthedRequest, res: Response, next: NextFunction) => {
+  const auth = (role?: Role) => async (req: AuthedRequest, res: Response, next: NextFunction) => {
     const header = req.headers.authorization;
     if (!header?.startsWith('Bearer ')) return res.status(401).json({ error: 'Not signed in' });
+    let sub: string;
     try {
-      const payload = jwt.verify(header.slice(7), jwtSecret) as { sub: string };
-      const user = d().users.find((u) => u.id === payload.sub);
-      if (!user) return res.status(401).json({ error: 'Not signed in' });
-      if (role && user.role !== role) return res.status(403).json({ error: 'Not allowed' });
-      req.user = user;
-      next();
+      sub = (jwt.verify(header.slice(7), jwtSecret) as { sub: string }).sub;
     } catch {
-      res.status(401).json({ error: 'Not signed in' });
+      return res.status(401).json({ error: 'Not signed in' });
     }
+    const user = await repo.findUser(sub);
+    if (!user) return res.status(401).json({ error: 'Not signed in' });
+    if (role && user.role !== role) return res.status(403).json({ error: 'Not allowed' });
+    req.user = user;
+    next();
   };
 
   const parse = <T extends z.ZodTypeAny>(schema: T, body: unknown, res: Response): z.infer<T> | undefined => {
@@ -100,7 +100,7 @@ export function createApp(store: Store, payments: PaymentProvider, jwtSecret: st
     return r.data;
   };
 
-  const mosqueView = (m: Mosque, userId?: string) => ({
+  const mosqueView = (m: MosqueWithFavorite) => ({
     id: m.id,
     name: m.name,
     city: m.city,
@@ -109,7 +109,7 @@ export function createApp(store: Store, payments: PaymentProvider, jwtSecret: st
     description: m.description,
     causes: m.causes,
     acceptingDonations: true, // the platform collects on every mosque's behalf; payouts are tracked separately
-    isFavorite: userId ? d().favorites.some((f) => f.userId === userId && f.mosqueId === m.id) : false,
+    isFavorite: m.isFavorite,
   });
 
   // ---------- auth ----------
@@ -132,7 +132,7 @@ export function createApp(store: Store, payments: PaymentProvider, jwtSecret: st
   app.post('/auth/register', async (req, res) => {
     const body = parse(registerSchema, req.body, res);
     if (!body) return;
-    if (d().users.some((u) => u.email === body.email)) return res.status(409).json({ error: 'Email already registered' });
+    if (await repo.findUserByEmail(body.email)) return res.status(409).json({ error: 'Email already registered' });
     const user: User = {
       id: newId(),
       name: body.name,
@@ -140,25 +140,31 @@ export function createApp(store: Store, payments: PaymentProvider, jwtSecret: st
       passwordHash: await bcrypt.hash(body.password, 10),
       role: body.mosque ? 'admin' : 'donor',
     };
-    if (body.mosque) {
-      const mosque: Mosque = {
-        id: newId(),
-        ...body.mosque,
-        causes: [{ id: newId(), title: 'General Fund', description: 'Day-to-day operations and upkeep.' }],
-        payoutsConnected: false,
-      };
-      d().mosques.push(mosque);
-      user.mosqueId = mosque.id;
+    try {
+      await repo.transaction(async (tx) => {
+        if (body.mosque) {
+          const mosque: Mosque = {
+            id: newId(),
+            ...body.mosque,
+            causes: [{ id: newId(), title: 'General Fund', description: 'Day-to-day operations and upkeep.' }],
+            payoutsConnected: false,
+          };
+          await tx.createMosque(mosque);
+          user.mosqueId = mosque.id;
+        }
+        await tx.createUser(user);
+      });
+    } catch (e) {
+      if (isUniqueViolation(e)) return res.status(409).json({ error: 'Email already registered' });
+      throw e;
     }
-    d().users.push(user);
-    store.save();
     res.status(201).json({ token: sign(user), user: publicUser(user) });
   });
 
   app.post('/auth/login', async (req, res) => {
     const body = parse(z.object({ email: z.string().trim().toLowerCase(), password: z.string() }), req.body, res);
     if (!body) return;
-    const user = d().users.find((u) => u.email === body.email);
+    const user = await repo.findUserByEmail(body.email);
     if (!user || !(await bcrypt.compare(body.password, user.passwordHash))) return res.status(401).json({ error: 'Invalid email or password' });
     res.json({ token: sign(user), user: publicUser(user) });
   });
@@ -166,37 +172,31 @@ export function createApp(store: Store, payments: PaymentProvider, jwtSecret: st
   app.get('/me', auth(), (req: AuthedRequest, res) => res.json(publicUser(req.user!)));
 
   // ---------- browsing mosques (donor) ----------
-  app.get('/mosques', auth(), (req: AuthedRequest, res) => {
-    const q = String(req.query.q ?? '').trim().toLowerCase();
-    const list = d().mosques.filter((m) => !q || [m.name, m.city, m.state].some((s) => s.toLowerCase().includes(q)));
-    res.json(list.map((m) => mosqueView(m, req.user!.id)));
+  app.get('/mosques', auth(), async (req: AuthedRequest, res) => {
+    const list = await repo.searchMosques(String(req.query.q ?? '').trim(), req.user!.id);
+    res.json(list.map(mosqueView));
   });
 
-  app.get('/mosques/:id', auth(), (req: AuthedRequest, res) => {
-    const m = d().mosques.find((x) => x.id === req.params.id);
+  app.get('/mosques/:id', auth(), async (req: AuthedRequest, res) => {
+    const m = await repo.getMosque(String(req.params.id), req.user!.id);
     if (!m) return res.status(404).json({ error: 'Mosque not found' });
-    res.json(mosqueView(m, req.user!.id));
+    res.json(mosqueView(m));
   });
 
   // ---------- favorites ----------
-  app.get('/favorites', auth(), (req: AuthedRequest, res) => {
-    const ids = d().favorites.filter((f) => f.userId === req.user!.id).map((f) => f.mosqueId);
-    res.json(d().mosques.filter((m) => ids.includes(m.id)).map((m) => mosqueView(m, req.user!.id)));
+  app.get('/favorites', auth(), async (req: AuthedRequest, res) => {
+    res.json((await repo.favoriteMosques(req.user!.id)).map(mosqueView));
   });
 
-  app.put('/favorites/:mosqueId', auth(), (req: AuthedRequest, res) => {
+  app.put('/favorites/:mosqueId', auth(), async (req: AuthedRequest, res) => {
     const mosqueId = String(req.params.mosqueId);
-    if (!d().mosques.some((m) => m.id === mosqueId)) return res.status(404).json({ error: 'Mosque not found' });
-    if (!d().favorites.some((f) => f.userId === req.user!.id && f.mosqueId === mosqueId)) {
-      d().favorites.push({ userId: req.user!.id, mosqueId });
-      store.save();
-    }
+    if (!(await repo.getMosque(mosqueId))) return res.status(404).json({ error: 'Mosque not found' });
+    await repo.addFavorite(req.user!.id, mosqueId);
     res.status(204).end();
   });
 
-  app.delete('/favorites/:mosqueId', auth(), (req: AuthedRequest, res) => {
-    d().favorites = d().favorites.filter((f) => !(f.userId === req.user!.id && f.mosqueId === req.params.mosqueId));
-    store.save();
+  app.delete('/favorites/:mosqueId', auth(), async (req: AuthedRequest, res) => {
+    await repo.removeFavorite(req.user!.id, String(req.params.mosqueId));
     res.status(204).end();
   });
 
@@ -218,10 +218,10 @@ export function createApp(store: Store, payments: PaymentProvider, jwtSecret: st
   const returnSchema = z.object({ returnUrl: z.string() }).refine((b) => allowedReturn(b.returnUrl), { message: 'returnUrl not allowed', path: ['returnUrl'] });
 
   const customerFor = async (user: User) => {
-    if (!user.paymentCustomerId) {
-      user.paymentCustomerId = await payments.createCustomer(user);
-      store.save();
-    }
+    if (user.paymentCustomerId) return user.paymentCustomerId;
+    const created = await payments.createCustomer(user);
+    // if two requests race, the first stored id wins and is used by both
+    user.paymentCustomerId = await repo.setPaymentCustomer(user.id, created);
     return user.paymentCustomerId;
   };
 
@@ -246,9 +246,7 @@ export function createApp(store: Store, payments: PaymentProvider, jwtSecret: st
     } catch {
       return res.status(404).json({ error: 'Not found' });
     }
-    // schedules that used this method fall back to the donor's next saved method
-    for (const r of d().recurring) if (r.userId === req.user!.id && r.paymentMethodId === req.params.id) r.paymentMethodId = undefined;
-    store.save();
+    await repo.clearRecurringMethod(req.user!.id, String(req.params.id));
     res.status(204).end();
   });
 
@@ -256,8 +254,8 @@ export function createApp(store: Store, payments: PaymentProvider, jwtSecret: st
   const amountSchema = z.number().int().min(MIN_CENTS).max(MAX_CENTS);
   const donationSchema = z.object({ mosqueId: z.string(), amountCents: amountSchema, causeId: z.string().optional(), paymentMethodId: z.string().optional() });
 
-  const checkTarget = (mosqueId: string, causeId: string | undefined, res: Response) => {
-    const mosque = d().mosques.find((m) => m.id === mosqueId);
+  const checkTarget = async (mosqueId: string, causeId: string | undefined, res: Response) => {
+    const mosque = await repo.getMosque(mosqueId);
     if (!mosque) return void res.status(404).json({ error: 'Mosque not found' });
     if (causeId && !mosque.causes.some((c) => c.id === causeId)) return void res.status(400).json({ error: 'Unknown cause' });
     return mosque;
@@ -266,11 +264,11 @@ export function createApp(store: Store, payments: PaymentProvider, jwtSecret: st
   app.post('/donations', auth(), async (req: AuthedRequest, res) => {
     const body = parse(donationSchema, req.body, res);
     if (!body) return;
-    const mosque = checkTarget(body.mosqueId, body.causeId, res);
+    const mosque = await checkTarget(body.mosqueId, body.causeId, res);
     if (!mosque) return;
     try {
       // a fresh key per request: donors may legitimately give the same amount twice
-      const out = await chargeDonation(store, payments, { user: req.user!, mosque, ...body, idempotencyKey: `don-${newId()}` });
+      const out = await chargeDonation(repo, payments, { user: req.user!, mosque, ...body, idempotencyKey: `don-${newId()}` });
       if (!out.ok) return res.status(out.code === 'no_payment_method' ? 409 : 402).json({ error: out.error, code: out.code });
       res.status(201).json(out.donation);
     } catch (e) {
@@ -279,12 +277,8 @@ export function createApp(store: Store, payments: PaymentProvider, jwtSecret: st
     }
   });
 
-  app.get('/donations', auth(), (req: AuthedRequest, res) => {
-    const list = d()
-      .donations.filter((x) => x.userId === req.user!.id)
-      .sort((a, b) => b.createdAt.localeCompare(a.createdAt))
-      .map((x) => ({ ...x, mosqueName: d().mosques.find((m) => m.id === x.mosqueId)?.name ?? 'Unknown' }));
-    res.json(list);
+  app.get('/donations', auth(), async (req: AuthedRequest, res) => {
+    res.json(await repo.donationsForUser(req.user!.id));
   });
 
   // ---------- recurring ----------
@@ -296,15 +290,11 @@ export function createApp(store: Store, payments: PaymentProvider, jwtSecret: st
     paymentMethodId: z.string().optional(),
   });
 
-  const recurringView = (r: ReturnType<typeof d>['recurring'][number]) => ({
-    ...r,
-    mosqueName: d().mosques.find((m) => m.id === r.mosqueId)?.name ?? 'Unknown',
-  });
-
   app.post('/recurring', auth(), async (req: AuthedRequest, res) => {
     const body = parse(recurringSchema, req.body, res);
     if (!body) return;
-    if (!checkTarget(body.mosqueId, body.causeId, res)) return;
+    const mosque = await checkTarget(body.mosqueId, body.causeId, res);
+    if (!mosque) return;
     const customerId = req.user!.paymentCustomerId;
     const methods = customerId ? await payments.listMethods(customerId) : [];
     if (!methods.length || (body.paymentMethodId && !methods.some((m) => m.id === body.paymentMethodId))) {
@@ -320,33 +310,31 @@ export function createApp(store: Store, payments: PaymentProvider, jwtSecret: st
       active: true,
       createdAt: now.toISOString(),
     };
-    d().recurring.push(r);
-    store.save();
-    res.status(201).json(recurringView(r));
+    await repo.createRecurring(r);
+    res.status(201).json({ ...r, mosqueName: mosque.name });
   });
 
-  app.get('/recurring', auth(), (req: AuthedRequest, res) => {
-    res.json(d().recurring.filter((r) => r.userId === req.user!.id && r.active).map(recurringView));
+  app.get('/recurring', auth(), async (req: AuthedRequest, res) => {
+    res.json(await repo.activeRecurringForUser(req.user!.id));
   });
 
-  app.delete('/recurring/:id', auth(), (req: AuthedRequest, res) => {
-    const r = d().recurring.find((x) => x.id === req.params.id && x.userId === req.user!.id);
-    if (!r) return res.status(404).json({ error: 'Not found' });
-    r.active = false;
-    store.save();
+  app.delete('/recurring/:id', auth(), async (req: AuthedRequest, res) => {
+    if (!(await repo.cancelRecurring(req.user!.id, String(req.params.id)))) return res.status(404).json({ error: 'Not found' });
     res.status(204).end();
   });
 
   // ---------- admin (mosque) ----------
-  const adminMosque = (req: AuthedRequest) => d().mosques.find((m) => m.id === req.user!.mosqueId)!;
+  const adminMosque = async (req: AuthedRequest) => (await repo.getMosque(req.user!.mosqueId!))!;
 
   app.get('/admin/mosque', auth('admin'), async (req: AuthedRequest, res) => {
-    const m = adminMosque(req);
+    let m = await adminMosque(req);
     // pick up onboarding finished on the provider's hosted page (webhooks may lag or be unconfigured)
     if (!m.payoutsConnected && m.payoutAccountId) {
       try {
-        m.payoutsConnected = await payments.isMosqueReady(m.payoutAccountId);
-        store.save();
+        if (await payments.isMosqueReady(m.payoutAccountId)) {
+          await repo.setMosquePayout(m.id, undefined, true);
+          m = { ...m, payoutsConnected: true };
+        }
       } catch (e) {
         console.error('payout status check failed', e);
       }
@@ -354,7 +342,7 @@ export function createApp(store: Store, payments: PaymentProvider, jwtSecret: st
     res.json({ ...mosqueView(m), payoutsConnected: m.payoutsConnected });
   });
 
-  app.put('/admin/mosque', auth('admin'), (req: AuthedRequest, res) => {
+  app.put('/admin/mosque', auth('admin'), async (req: AuthedRequest, res) => {
     const body = parse(
       z.object({
         name: z.string().trim().min(1),
@@ -367,82 +355,53 @@ export function createApp(store: Store, payments: PaymentProvider, jwtSecret: st
       res,
     );
     if (!body) return;
-    Object.assign(adminMosque(req), body);
-    store.save();
-    res.json(mosqueView(adminMosque(req)));
+    await repo.updateMosqueProfile(req.user!.mosqueId!, body);
+    res.json(mosqueView(await adminMosque(req)));
   });
 
   // Returns { url } for the provider's hosted onboarding page, or { url: null, payoutsConnected: true } when no onboarding is needed.
   app.post('/admin/payouts/connect', auth('admin'), async (req: AuthedRequest, res) => {
     const body = parse(returnSchema, req.body, res);
     if (!body) return;
-    const m = adminMosque(req);
+    const m = await adminMosque(req);
     const step = await payments.beginMosqueOnboarding(m, returnLink(body.returnUrl));
-    m.payoutAccountId = step.accountId;
-    if (!step.url) m.payoutsConnected = await payments.isMosqueReady(step.accountId);
-    store.save();
-    res.json({ url: step.url, payoutsConnected: m.payoutsConnected });
+    const connected = step.url ? m.payoutsConnected : await payments.isMosqueReady(step.accountId);
+    await repo.setMosquePayout(m.id, step.accountId, connected);
+    res.json({ url: step.url, payoutsConnected: connected });
   });
 
   const causeSchema = z.object({ title: z.string().trim().min(1), description: z.string().trim().default('') });
 
-  app.post('/admin/causes', auth('admin'), (req: AuthedRequest, res) => {
+  app.post('/admin/causes', auth('admin'), async (req: AuthedRequest, res) => {
     const body = parse(causeSchema, req.body, res);
     if (!body) return;
     const cause = { id: newId(), ...body };
-    adminMosque(req).causes.push(cause);
-    store.save();
+    await repo.addCause(req.user!.mosqueId!, cause);
     res.status(201).json(cause);
   });
 
-  app.put('/admin/causes/:id', auth('admin'), (req: AuthedRequest, res) => {
+  app.put('/admin/causes/:id', auth('admin'), async (req: AuthedRequest, res) => {
     const body = parse(causeSchema, req.body, res);
     if (!body) return;
-    const cause = adminMosque(req).causes.find((c) => c.id === req.params.id);
-    if (!cause) return res.status(404).json({ error: 'Not found' });
-    Object.assign(cause, body);
-    store.save();
+    const cause = { id: String(req.params.id), ...body };
+    if (!(await repo.updateCause(req.user!.mosqueId!, cause))) return res.status(404).json({ error: 'Not found' });
     res.json(cause);
   });
 
-  app.delete('/admin/causes/:id', auth('admin'), (req: AuthedRequest, res) => {
-    const m = adminMosque(req);
-    m.causes = m.causes.filter((c) => c.id !== req.params.id);
-    store.save();
+  app.delete('/admin/causes/:id', auth('admin'), async (req: AuthedRequest, res) => {
+    await repo.deleteCause(req.user!.mosqueId!, String(req.params.id));
     res.status(204).end();
   });
 
-  app.get('/admin/donations', auth('admin'), (req: AuthedRequest, res) => {
-    const m = adminMosque(req);
-    const all = d().donations.filter((x) => x.mosqueId === m.id && x.status === 'succeeded');
-    const now = new Date();
-    const monthStart = new Date(Date.UTC(now.getUTCFullYear(), now.getUTCMonth(), 1)).toISOString();
-    const sum = (xs: typeof all) => xs.reduce((s, x) => s + x.amountCents, 0);
+  app.get('/admin/donations', auth('admin'), async (req: AuthedRequest, res) => {
+    const mosqueId = req.user!.mosqueId!;
+    const { donations, ...summary } = await repo.adminReport(mosqueId);
     res.json({
-      summary: {
-        totalCents: sum(all),
-        thisMonthCents: sum(all.filter((x) => x.createdAt >= monthStart)),
-        donationCount: all.length,
-        activeRecurring: d().recurring.filter((r) => r.mosqueId === m.id && r.active).length,
-        // collected for this mosque and not yet paid out
-        balanceCents: balanceOf(store, m.id),
-      },
-      payouts: d()
-        .payouts.filter((x) => x.mosqueId === m.id && x.status !== 'failed')
-        .sort((a, b) => b.createdAt.localeCompare(a.createdAt))
-        .map((x) => ({ id: x.id, amountCents: x.amountCents, method: x.method, status: x.status, createdAt: x.createdAt })),
+      // balanceCents = collected for this mosque and not yet paid out
+      summary: { ...summary, balanceCents: await repo.balanceOf(mosqueId) },
+      payouts: (await repo.payoutsForMosque(mosqueId)).map((x) => ({ id: x.id, amountCents: x.amountCents, method: x.method, status: x.status, createdAt: x.createdAt })),
       // donor names are shown to the mosque admin; email is intentionally not exposed
-      donations: all
-        .sort((a, b) => b.createdAt.localeCompare(a.createdAt))
-        .slice(0, 100)
-        .map((x) => ({
-          id: x.id,
-          amountCents: x.amountCents,
-          createdAt: x.createdAt,
-          recurring: !!x.recurringId,
-          donorName: d().users.find((u) => u.id === x.userId)?.name ?? 'Anonymous',
-          cause: m.causes.find((c) => c.id === x.causeId)?.title,
-        })),
+      donations,
     });
   });
 
@@ -450,24 +409,24 @@ export function createApp(store: Store, payments: PaymentProvider, jwtSecret: st
   const operator = (req: AuthedRequest, res: Response, next: NextFunction) =>
     opts.operatorEmails.includes(req.user!.email) ? next() : void res.status(403).json({ error: 'Not allowed' });
 
-  app.get('/ops/balances', auth(), operator, (_req, res) => {
-    const rows = d().mosques.map((m) => ({
+  app.get('/ops/balances', auth(), operator, async (_req, res) => {
+    const balances = await repo.balancesByAccount();
+    const rows = (await repo.listMosques()).map((m) => ({
       mosqueId: m.id,
       name: m.name,
-      owedCents: balanceOf(store, m.id),
+      owedCents: balances.get(m.id) ?? 0,
       payoutsConnected: m.payoutsConnected,
     }));
-    res.json({ mosques: rows, platformCents: balanceOf(store, PLATFORM), totalOwedCents: rows.reduce((s, r) => s + r.owedCents, 0) });
+    res.json({ mosques: rows, platformCents: balances.get(PLATFORM) ?? 0, totalOwedCents: rows.reduce((s, r) => s + r.owedCents, 0) });
   });
 
-  app.get('/ops/ledger', auth(), operator, (req, res) => {
-    const account = req.query.account ? String(req.query.account) : undefined;
-    res.json(d().ledger.filter((e) => !account || e.account === account).slice(-200).reverse());
+  app.get('/ops/ledger', auth(), operator, async (req, res) => {
+    res.json(await repo.recentLedger(req.query.account ? String(req.query.account) : undefined));
   });
 
   app.get('/ops/reconcile', auth(), operator, async (req, res) => {
     const bankCents = Math.trunc(Number(req.query.bankCents ?? 0)) || 0;
-    res.json(await reconcile(store, payments, bankCents));
+    res.json(await reconcile(repo, payments, bankCents));
   });
 
   const payoutSchema = z.object({
@@ -480,31 +439,38 @@ export function createApp(store: Store, payments: PaymentProvider, jwtSecret: st
   app.post('/ops/payouts', auth(), operator, async (req, res) => {
     const body = parse(payoutSchema, req.body, res);
     if (!body) return;
-    const mosque = d().mosques.find((m) => m.id === body.mosqueId);
+    const mosque = await repo.getMosque(body.mosqueId);
     if (!mosque) return res.status(404).json({ error: 'Mosque not found' });
     if (body.method === 'stripe_transfer' && !(mosque.payoutsConnected && mosque.payoutAccountId)) {
       return res.status(409).json({ error: 'This mosque has not finished payout onboarding. Use ach_manual or wait for onboarding.' });
     }
     let payout;
     try {
-      payout = createPayout(store, mosque.id, body.amountCents, body.method);
+      payout = await createPayout(repo, mosque.id, body.amountCents, body.method);
     } catch (e) {
-      return res.status(409).json({ error: (e as Error).message });
+      if (e instanceof PayoutError) return res.status(409).json({ error: e.message });
+      throw e;
     }
     if (body.method === 'ach_manual') {
       // the operator sends the ACH from the bank; this records that it happened
-      completePayout(store, payout, body.reference);
+      await completePayout(repo, payout, body.reference);
       return res.status(201).json(payout);
     }
     try {
       const t = await payments.transfer({ accountId: mosque.payoutAccountId!, amountCents: payout.amountCents, idempotencyKey: `payout-${payout.id}` });
-      completePayout(store, payout, t.reference);
+      await completePayout(repo, payout, t.reference);
       res.status(201).json(payout);
     } catch (e) {
       console.error('transfer failed', e);
-      failPayout(store, payout); // credit the mosque's balance back
+      await failPayout(repo, payout); // credit the mosque's balance back
       res.status(502).json({ error: 'Transfer failed; the balance was restored.' });
     }
+  });
+
+  // Express 5 forwards rejected async handlers here
+  app.use((err: unknown, _req: Request, res: Response, _next: NextFunction) => {
+    console.error('unhandled error', err);
+    res.status(500).json({ error: 'Something went wrong' });
   });
 
   return app;

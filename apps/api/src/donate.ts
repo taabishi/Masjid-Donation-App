@@ -1,6 +1,7 @@
 import type { PaymentProvider } from './payments.js';
 import { settleDonation } from './ledger.js';
-import { newId, type Donation, type Mosque, type Store, type User } from './store.js';
+import type { Repo } from './repo.js';
+import { newId, type Donation, type Mosque, type User } from './types.js';
 
 export type DonateOutcome =
   | { ok: true; donation: Donation }
@@ -12,7 +13,7 @@ export type DonateOutcome =
  * with the same idempotencyKey).
  */
 export async function chargeDonation(
-  store: Store,
+  repo: Repo,
   payments: PaymentProvider,
   opts: {
     user: User;
@@ -57,10 +58,9 @@ export async function chargeDonation(
     paymentRef: result.reference,
     createdAt: (opts.now ?? new Date()).toISOString(),
   };
-  store.data.donations.push(donation);
-  store.save();
+  const saved = await repo.createDonation(donation); // returns the existing row if this charge was already recorded
   // when the fee isn't known yet (e.g. bank debits) the periodic settleUnsettled sweep records it
-  if (result.status === 'succeeded' && typeof result.feeCents === 'number') settleDonation(store, donation, result.feeCents);
-  if (result.status === 'failed') return { ok: false, code: 'payment_failed', error: result.error ?? 'Payment failed', donation };
-  return { ok: true, donation };
+  if (saved.status === 'succeeded' && typeof result.feeCents === 'number') await settleDonation(repo, saved, result.feeCents);
+  if (result.status === 'failed') return { ok: false, code: 'payment_failed', error: result.error ?? 'Payment failed', donation: saved };
+  return { ok: true, donation: saved };
 }

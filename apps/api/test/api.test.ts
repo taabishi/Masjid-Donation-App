@@ -4,14 +4,14 @@ import type { AddressInfo } from 'node:net';
 import { createApp } from '../src/app.js';
 import { MockPaymentProvider } from '../src/payments.js';
 import { addPeriod, processDueRecurring } from '../src/recurring.js';
-import { Store } from '../src/store.js';
+import { newRepo } from './helpers.js';
 
 const RET = { returnUrl: 'http://localhost:8081/payment-methods' };
 
 async function setup() {
-  const store = new Store();
+  const { repo } = await newRepo({ seed: true });
   const payments = new MockPaymentProvider();
-  const server = createApp(store, payments, 'test', {
+  const server = createApp(repo, payments, 'test', {
     apiPublicUrl: 'http://localhost',
     allowedReturnPrefixes: ['http://localhost:8081'],
     operatorEmails: ['ops@example.com'],
@@ -26,11 +26,11 @@ async function setup() {
     const text = await res.text();
     return { status: res.status, body: text ? JSON.parse(text) : undefined };
   };
-  return { store, payments, call, close: () => server.close() };
+  return { repo, payments, call, close: async () => { server.close(); await repo.close(); } };
 }
 
 test('donor flow: favorite, donate, recurring, history', async () => {
-  const { store, payments, call, close } = await setup();
+  const { repo, payments, call, close } = await setup();
   const reg = await call('POST', '/auth/register', { name: 'Ali', email: 'ali@example.com', password: 'password1' });
   assert.equal(reg.status, 201);
   const t = reg.body.token;
@@ -56,15 +56,15 @@ test('donor flow: favorite, donate, recurring, history', async () => {
   const rec = await call('POST', '/recurring', { mosqueId: m.id, amountCents: 1500, frequency: 'weekly' }, t);
   assert.equal(rec.status, 201);
   // not due yet
-  assert.equal(await processDueRecurring(store, payments), 0);
+  assert.equal(await processDueRecurring(repo, payments), 0);
   // due in 8 days -> one charge, schedule advances
-  assert.equal(await processDueRecurring(store, payments, new Date(Date.now() + 8 * 86_400_000)), 1);
+  assert.equal(await processDueRecurring(repo, payments, new Date(Date.now() + 8 * 86_400_000)), 1);
   const hist = (await call('GET', '/donations', undefined, t)).body;
   assert.equal(hist.length, 2);
 
   assert.equal((await call('DELETE', `/recurring/${rec.body.id}`, undefined, t)).status, 204);
   assert.equal((await call('GET', '/recurring', undefined, t)).body.length, 0);
-  close();
+  await close();
 });
 
 test('platform collects for a mosque before it onboards; operator pays out from the ledger', async () => {
@@ -108,7 +108,7 @@ test('platform collects for a mosque before it onboards; operator pays out from 
   const after = (await call('GET', '/admin/donations', undefined, at)).body;
   assert.equal(after.summary.balanceCents, 0);
   assert.equal(after.payouts.length, 2);
-  close();
+  await close();
 });
 
 test('reconciliation matches the provider balance', async () => {
@@ -125,7 +125,7 @@ test('reconciliation matches the provider balance', async () => {
   const rec = (await call('GET', '/ops/reconcile', undefined, ops)).body;
   assert.equal(rec.diffCents, 0);
   assert.equal(rec.unsettledDonations, 0);
-  close();
+  await close();
 });
 
 test('authorization boundaries', async () => {
@@ -134,14 +134,14 @@ test('authorization boundaries', async () => {
   const donor = (await call('POST', '/auth/register', { name: 'A', email: 'a@example.com', password: 'password1' })).body.token;
   assert.equal((await call('GET', '/admin/mosque', undefined, donor)).status, 403);
   assert.equal((await call('POST', '/auth/login', { email: 'a@example.com', password: 'wrong' })).status, 401);
-  close();
+  await close();
 });
 
 test('return page only redirects to allowed addresses', async () => {
   const { call, close } = await setup();
   const t = (await call('POST', '/auth/register', { name: 'A', email: 'a@example.com', password: 'password1' })).body.token;
   assert.equal((await call('POST', '/payment-methods', { returnUrl: 'https://evil.example/x' }, t)).status, 400);
-  close();
+  await close();
 });
 
 test('monthly period clamps to end of month', () => {

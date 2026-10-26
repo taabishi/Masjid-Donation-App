@@ -1,6 +1,7 @@
-import type { Frequency, Store } from './store.js';
+import type { Frequency } from './types.js';
 import { chargeDonation } from './donate.js';
 import type { PaymentProvider } from './payments.js';
+import type { Repo } from './repo.js';
 
 export function addPeriod(iso: string, freq: Frequency): string {
   const d = new Date(iso);
@@ -16,19 +17,20 @@ export function addPeriod(iso: string, freq: Frequency): string {
 }
 
 /** Charge every active schedule that is due. Safe to call repeatedly. */
-export async function processDueRecurring(store: Store, payments: PaymentProvider, now = new Date()) {
+export async function processDueRecurring(repo: Repo, payments: PaymentProvider, now = new Date()) {
   let processed = 0;
-  for (const r of [...store.data.recurring]) {
-    if (!r.active || new Date(r.nextDate) > now) continue;
-    const user = store.data.users.find((u) => u.id === r.userId);
-    const mosque = store.data.mosques.find((m) => m.id === r.mosqueId);
+  for (const r of await repo.dueRecurring(now)) {
+    const user = await repo.findUser(r.userId);
+    const mosque = await repo.getMosque(r.mosqueId);
     if (!user || !mosque) {
-      r.active = false;
+      await repo.deactivateRecurring(r.id);
       continue;
     }
     try {
-      // the key is stable per schedule + due date, so retrying after an outage can't double-charge
-      await chargeDonation(store, payments, {
+      // the key is stable per schedule + due date, so retrying after an outage (or a second server
+      // instance running the same sweep) can't double-charge: Stripe returns the same payment and
+      // the donations table de-duplicates on its id
+      await chargeDonation(repo, payments, {
         user,
         mosque,
         amountCents: r.amountCents,
@@ -45,9 +47,8 @@ export async function processDueRecurring(store: Store, payments: PaymentProvide
     // charge at most once per run; skip any periods missed during downtime
     let next = addPeriod(r.nextDate, r.frequency);
     while (new Date(next) <= now) next = addPeriod(next, r.frequency);
-    r.nextDate = next;
+    await repo.advanceRecurring(r.id, next);
     processed++;
   }
-  if (processed) store.save();
   return processed;
 }

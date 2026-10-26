@@ -10,12 +10,13 @@ A digital donation box for the mosques you visit. One codebase runs on iPhone, A
 | Path | What |
 |---|---|
 | `apps/app` | Expo (React Native + web) app using expo-router. Donor area `app/(donor)`, admin area `app/(admin)`. |
-| `apps/api` | TypeScript/Express API. JSON-file store, JWT auth, recurring-charge scheduler. |
+| `apps/api` | TypeScript/Express API on Postgres (Supabase in production). JWT auth, ledger, recurring-charge scheduler. SQL migrations in `apps/api/migrations`. |
 
 ## Run it
 
 ```bash
-# API (http://localhost:4000, seeded with 3 demo mosques)
+# API (http://localhost:4000, seeded with 3 demo mosques).
+# With no DATABASE_URL it uses an embedded local Postgres in apps/api/data (development only).
 cd apps/api && npm install && npm start
 
 # App
@@ -24,9 +25,28 @@ cd apps/app && npm install && npm run web      # or: npm run ios / npm run andro
 
 On a physical phone or Android emulator, point the app at your machine: `EXPO_PUBLIC_API_URL=http://<LAN-IP>:4000 npm start`.
 
-Tests: `cd apps/api && npm test`. Typecheck: `npm run typecheck` in either app.
+Tests: `cd apps/api && npm test` (runs on in-memory Postgres). To run the same tests against a real server through the production `pg` driver: `TEST_DATABASE_URL='postgres://user@localhost:5432/postgres?sslmode=disable' npm test` (the user must be allowed to `CREATE DATABASE`). Typecheck: `npm run typecheck` in either app.
 
 Sign up as "I run a mosque" for the admin panel, or as a donor to give.
+
+## Database (Supabase)
+
+The API stores everything in Postgres. In production use a Supabase project:
+
+1. Create a project. Under **Project Settings > Database** copy the **direct connection** string (or the **session pooler** string). Do **not** use the transaction pooler (port 6543): the ledger relies on transactions and row locks.
+2. Under **Database > Settings > SSL** download the CA certificate. The API verifies TLS, and Supabase's chain is not in the default trust store, so pass the PEM as `DATABASE_CA_CERT`.
+3. Set `DATABASE_URL` (and `DATABASE_CA_CERT`) on the API host. Migrations in `apps/api/migrations` are applied automatically at startup and tracked in `schema_migrations`.
+4. In Supabase, turn on automatic backups and point-in-time recovery (paid plans). This database holds money records.
+
+| Variable | Purpose |
+|---|---|
+| `DATABASE_URL` | Postgres connection string. Required in production; without it the API uses an embedded dev database |
+| `DATABASE_CA_CERT` | PEM of the server's CA, for verified TLS |
+| `DATABASE_SSL_INSECURE` | `true` skips certificate verification. Avoid; only if you cannot supply the CA |
+
+**Security model.** Supabase auto-exposes every table in `public` over its REST API with the public `anon` key. The migration enables Row Level Security on every table with no policies, which denies all of that access; only this API (connecting as the table owner) can read or write. Don't add policies or expose the Supabase keys in the app. The app never talks to Supabase directly, only to this API.
+
+**Data guarantees enforced by the database itself:** `ledger_entries` rejects UPDATE, DELETE and TRUNCATE (append-only); money columns must be positive integer cents; `payment_ref` is unique so a retried charge can't create a second donation; settling a donation, refunds and payouts run in transactions with row locks so concurrent requests can't double-spend a mosque's balance.
 
 ## Payments (Stripe)
 
@@ -79,6 +99,7 @@ Operator endpoints (bearer token of an `OPERATOR_EMAILS` user):
 - Reconciliation can show a small persistent difference: Stripe dispute fees and refund fees are not ledgered yet. Disputes and refunds reduce the mosque's balance by the gross amount only.
 - Off-session charges that need 3-D Secure fail with a message asking the donor to re-add the method.
 - Receipts / tax statements are not generated. Donors see the platform's name on statements.
-- **Storage** is a JSON file (`apps/api/data/db.json`); a financial ledger belongs in a transactional database (e.g. Postgres) with the ledger insert in the same transaction as the donation update.
+- The `pg` path has been verified against a local Postgres 16 server (full test suite + browser run) but not against an actual Supabase project: expect to troubleshoot connection/TLS settings on first connect.
+- A donation row is saved after Stripe confirms the charge, in a separate step from the ledger settlement; if the server crashes between them the periodic `settleUnsettled` sweep completes the ledger. If it crashes between the Stripe charge and saving the donation row, retried recurring charges are de-duplicated by Stripe's idempotency key, but a one-time donation could be charged without a row (reconciliation will show the difference).
 - Missing: password reset / email verification, inviting additional mosque staff, push notifications, rate limiting, an operator UI (endpoints only).
 - Recurring charges and settlement sweeps run from an in-process timer; use a proper job queue/cron when deployed.

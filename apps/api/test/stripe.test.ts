@@ -2,7 +2,7 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 import type Stripe from 'stripe';
 import { StripePaymentProvider } from '../src/payments.js';
-import type { Mosque } from '../src/store.js';
+import type { Mosque } from '../src/types.js';
 
 const mosque = { id: 'm1', name: 'Masjid', payoutAccountId: 'acct_1', payoutsConnected: true } as Mosque;
 

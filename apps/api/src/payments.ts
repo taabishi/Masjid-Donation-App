@@ -1,6 +1,6 @@
 import { randomUUID } from 'node:crypto';
 import Stripe from 'stripe';
-import type { Mosque, User } from './store.js';
+import type { Mosque, User } from './types.js';
 
 export interface SavedMethod {
   id: string;

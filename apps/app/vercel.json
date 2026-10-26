@@ -1,0 +1,5 @@
+{
+  "buildCommand": "CI=1 npm run export",
+  "outputDirectory": "dist",
+  "rewrites": [{ "source": "/(.*)", "destination": "/index.html" }]
+}

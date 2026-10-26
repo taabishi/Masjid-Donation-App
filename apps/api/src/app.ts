@@ -27,6 +27,8 @@ export interface AppOptions {
   operatorEmails: string[];
   /** Tax-exempt directory used to pre-check EINs for the reviewer. */
   directory?: NonprofitDirectory;
+  /** Browser origins allowed to call the API. Empty/omitted = any origin (development only). Native apps send no Origin and are unaffected. */
+  corsOrigins?: string[];
 }
 
 export function createApp(
@@ -36,7 +38,9 @@ export function createApp(
   opts: AppOptions = { apiPublicUrl: 'http://localhost:4000', allowedReturnPrefixes: ['http://localhost:8081', 'masjiddonation://', 'exp://'], operatorEmails: [] },
 ) {
   const app = express();
-  app.use(cors());
+  app.use(cors(opts.corsOrigins?.length ? { origin: opts.corsOrigins } : undefined));
+
+  app.get('/health', (_req, res) => res.json({ ok: true })); // for the hosting platform's health check
 
   // Stripe signs the raw body, so this must be registered before express.json().
   app.post('/webhooks/payments', express.raw({ type: '*/*' }), async (req, res) => {

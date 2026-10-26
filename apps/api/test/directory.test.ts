@@ -38,3 +38,20 @@ test('ProPublica client parses the documented shape, 404 as not found, other err
   // leading zeros are restored when the API returns the EIN as a number
   assert.equal((await mk(200, { organization: { ein: 12345678, name: 'X' } }).lookupEin('012345678'))?.ein, '012345678');
 });
+
+import { productionConfigProblems } from '../src/config.js';
+
+test('production refuses to start with risky or missing settings', () => {
+  const good = {
+    JWT_SECRET: 'x'.repeat(32), DATABASE_URL: 'postgres://x', CORS_ORIGINS: 'https://app.example', API_PUBLIC_URL: 'https://api.example',
+    STRIPE_SECRET_KEY: 'sk_test_x', STRIPE_WEBHOOK_SECRET: 'whsec_x',
+  };
+  assert.deepEqual(productionConfigProblems(good), []);
+  assert.equal(productionConfigProblems({}).length, 5);
+  // forgetting Stripe must not silently fall back to fake payments
+  const noStripe = { ...good, STRIPE_SECRET_KEY: undefined, STRIPE_WEBHOOK_SECRET: undefined };
+  assert.equal(productionConfigProblems(noStripe).length, 1);
+  assert.deepEqual(productionConfigProblems({ ...noStripe, ALLOW_MOCK_PAYMENTS: 'true' }), []);
+  assert.equal(productionConfigProblems({ ...good, STRIPE_WEBHOOK_SECRET: undefined }).length, 1);
+  assert.equal(productionConfigProblems({ ...good, JWT_SECRET: 'short' }).length, 1);
+});

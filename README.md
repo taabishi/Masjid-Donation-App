@@ -49,6 +49,10 @@ The API stores everything in Postgres. In production use a Supabase project:
 
 **Data guarantees enforced by the database itself:** `ledger_entries` rejects UPDATE, DELETE and TRUNCATE (append-only); money columns must be positive integer cents; `payment_ref` is unique so a retried charge can't create a second donation; settling a donation, refunds and payouts run in transactions with row locks so concurrent requests can't double-spend a mosque's balance.
 
+## Deploying
+
+See [DEPLOY.md](DEPLOY.md): Supabase (database) + Render (API, `render.yaml`) + Vercel (web app, `apps/app/vercel.json`). The API refuses to start in production without the required settings (`apps/api/src/config.ts`).
+
 ## Payments (Stripe)
 
 Without `STRIPE_SECRET_KEY` the API uses a **mock** provider (instant fake cards/bank accounts, nothing real moves) and seeds demo mosques. With a key it uses **Stripe**:

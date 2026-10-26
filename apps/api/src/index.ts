@@ -1,5 +1,6 @@
 import Stripe from 'stripe';
 import { createApp } from './app.js';
+import { productionConfigProblems } from './config.js';
 import { createPgDb, createPgliteDb, migrate } from './db.js';
 import { settleUnsettled } from './ledger.js';
 import { MockPaymentProvider, StripePaymentProvider } from './payments.js';
@@ -8,8 +9,11 @@ import { Repo } from './repo.js';
 import { seedDemoMosques } from './seed.js';
 
 const production = process.env.NODE_ENV === 'production';
+if (production) {
+  const problems = productionConfigProblems(process.env);
+  if (problems.length) throw new Error('Refusing to start in production:\n - ' + problems.join('\n - '));
+}
 const secret = process.env.JWT_SECRET;
-if (!secret && production) throw new Error('JWT_SECRET is required in production');
 
 const port = Number(process.env.PORT ?? 4000);
 const stripeKey = process.env.STRIPE_SECRET_KEY;
@@ -21,7 +25,6 @@ if (stripeKey && !process.env.STRIPE_WEBHOOK_SECRET) console.warn('STRIPE_WEBHOO
 
 // Postgres (e.g. Supabase) when DATABASE_URL is set; otherwise an embedded local Postgres for development.
 const databaseUrl = process.env.DATABASE_URL;
-if (!databaseUrl && production) throw new Error('DATABASE_URL is required in production');
 const db = databaseUrl
   ? await createPgDb(databaseUrl, { caCert: process.env.DATABASE_CA_CERT, insecureSsl: process.env.DATABASE_SSL_INSECURE === 'true' })
   : await createPgliteDb(process.env.DATA_DIR ?? 'data/pglite');
@@ -38,6 +41,7 @@ if (!stripeKey) await seedDemoMosques(repo);
 const app = createApp(repo, payments, secret ?? 'dev-only-secret', {
   apiPublicUrl: process.env.API_PUBLIC_URL ?? `http://localhost:${port}`,
   allowedReturnPrefixes: (process.env.APP_RETURN_PREFIXES ?? 'http://localhost:8081,masjiddonation://,exp://').split(','),
+  corsOrigins: (process.env.CORS_ORIGINS ?? '').split(',').map((o) => o.trim()).filter(Boolean),
   operatorEmails: (process.env.OPERATOR_EMAILS ?? '').split(',').map((e) => e.trim().toLowerCase()).filter(Boolean),
 });
 

@@ -1,0 +1,33 @@
+# Render Blueprint for the API. The web app is deployed separately on Vercel (see DEPLOY.md).
+services:
+  - type: web
+    name: masjid-donation-api
+    runtime: node
+    plan: free # free instances sleep when idle; use a paid plan for real use (recurring donations need it awake)
+    rootDir: apps/api
+    buildCommand: npm ci --include=dev && npm run build
+    startCommand: npm run start:prod
+    healthCheckPath: /health
+    envVars:
+      - key: NODE_VERSION
+        value: 22
+      - key: NODE_ENV
+        value: production
+      - key: JWT_SECRET
+        generateValue: true
+      - key: DATABASE_URL # Supabase session pooler connection string
+        sync: false
+      - key: DATABASE_CA_CERT # Supabase CA certificate (PEM)
+        sync: false
+      - key: API_PUBLIC_URL # this service's https URL, e.g. https://masjid-donation-api.onrender.com
+        sync: false
+      - key: CORS_ORIGINS # your Vercel URL, e.g. https://masjid-donation.vercel.app
+        sync: false
+      - key: APP_RETURN_PREFIXES # your Vercel URL plus masjiddonation://
+        sync: false
+      - key: OPERATOR_EMAILS # comma-separated emails that may review organizations and pay out
+        sync: false
+      # Demo mode: fake payments, nothing real moves. Remove this and set STRIPE_SECRET_KEY /
+      # STRIPE_WEBHOOK_SECRET for real payments.
+      - key: ALLOW_MOCK_PAYMENTS
+        value: "true"

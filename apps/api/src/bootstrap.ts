@@ -12,7 +12,8 @@ import { seedDemoMosques } from './seed.js';
  * and the Vercel serverless entry (serverless.ts).
  */
 export async function buildServices(env: NodeJS.ProcessEnv, opts: { maxConnections?: number; runMigrations: boolean; seedDemoData: boolean }) {
-  const production = env.NODE_ENV === 'production';
+  // Vercel sets VERCEL for every deployment (including previews): treat all of them as production
+  const production = env.NODE_ENV === 'production' || !!env.VERCEL;
   if (production) {
     const problems = productionConfigProblems(env);
     if (problems.length) throw new Error('Refusing to start in production:\n - ' + problems.join('\n - '));
